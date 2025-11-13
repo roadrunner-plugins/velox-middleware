@@ -1,250 +1,414 @@
-package veloxmiddleware
+package velox
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/roadrunner-server/errors"
+	rrerrors "github.com/roadrunner-server/errors"
 	"go.uber.org/zap"
 )
 
 const (
-	// PluginName is the unique identifier for the Velox middleware plugin
+	// PluginName is the name of the plugin
 	PluginName = "velox"
 
-	// HeaderVeloxBuild is the HTTP header that triggers Velox build interception
-	HeaderVeloxBuild = "X-Velox-Build"
+	// xVeloxBuildHeader is the header that indicates a Velox build request
+	xVeloxBuildHeader = "X-Velox-Build"
+
+	// ContentTypeJSON is the expected content type for build requests
+	ContentTypeJSON = "application/json"
+
+	// ContentTypeOctetStream is the content type for binary responses
+	ContentTypeOctetStream = "application/octet-stream"
+
+	// bufSize is the buffer size for file streaming (10MB)
+	bufSize = 10 * 1024 * 1024
 )
 
-// Plugin represents the Velox middleware plugin that intercepts HTTP responses
-// containing Velox build requests, manages caching, and streams binaries directly
-// to clients without blocking PHP workers.
-type Plugin struct {
-	cfg    *Config
-	log    *zap.Logger
-	cache  *CacheManager
-	client *VeloxClient
-	sem    *semaphore // limits concurrent builds
-
-	// Response writer pool for capturing PHP worker responses
-	writersPool sync.Pool
-
-	// Lifecycle management
-	mu      sync.RWMutex
-	serving bool
-	stopCh  chan struct{}
+// Logger interface for structured logging
+type Logger interface {
+	NamedLogger(name string) *zap.Logger
 }
 
-// Init initializes the plugin with configuration and dependencies.
-// This method is called by the Endure container during plugin initialization.
+// Configurer provides access to plugin configuration
+type Configurer interface {
+	UnmarshalKey(name string, out any) error
+	Has(name string) bool
+}
+
+// Plugin is the Velox middleware plugin
+type Plugin struct {
+	log         *zap.Logger
+	cfg         *Config
+	httpClient  *http.Client
+	writersPool sync.Pool
+}
+
+// Init initializes the plugin with configuration and dependencies
 func (p *Plugin) Init(cfg Configurer, log Logger) error {
-	const op = errors.Op("velox_plugin_init")
+	const op = rrerrors.Op("velox_plugin_init")
 
 	if !cfg.Has(PluginName) {
-		return errors.E(op, errors.Disabled)
+		return rrerrors.E(op, rrerrors.Disabled)
 	}
 
+	// Initialize logger
+	p.log = log.NamedLogger(PluginName)
+
 	// Parse configuration
-	if err := cfg.UnmarshalKey(PluginName, &p.cfg); err != nil {
-		return errors.E(op, err)
+	p.cfg = &Config{}
+	if err := cfg.UnmarshalKey(PluginName, p.cfg); err != nil {
+		return rrerrors.E(op, err)
 	}
+
+	// Set defaults
+	p.cfg.InitDefaults()
 
 	// Validate configuration
 	if err := p.cfg.Validate(); err != nil {
-		return errors.E(op, err)
+		return rrerrors.E(op, err)
 	}
 
-	p.log = log.NamedLogger(PluginName)
-	p.stopCh = make(chan struct{})
+	// Initialize HTTP client
+	p.httpClient = &http.Client{
+		Timeout: p.cfg.RequestTimeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 
-	// Initialize response writer pool for capturing PHP responses
+	// Initialize writer pool
 	p.writersPool = sync.Pool{
 		New: func() any {
-			wr := new(responseWriter)
+			wr := new(writer)
 			wr.code = http.StatusOK
-			wr.data = make([]byte, 0, 1024) // Initial capacity for response body
-			wr.hdrToSend = make(map[string][]string, 10)
+			wr.data = make([]byte, 0, 10)
+			wr.hdrToSend = make(map[string][]string, 2)
 			return wr
 		},
 	}
 
-	// Initialize metrics early
-	initMetrics()
-
-	// Initialize semaphore for build concurrency control
-	p.sem = newSemaphore(p.cfg.MaxConcurrentBuilds)
-
-	// Initialize Velox client
-	client, err := NewVeloxClient(p.cfg, p.log)
-	if err != nil {
-		return errors.E(op, errors.Str("failed to create velox client"), err)
-	}
-	p.client = client
-
-	// Initialize cache manager
-	if p.cfg.Cache.Enabled {
-		cache, err := NewCacheManager(p.cfg.Cache, p.log)
-		if err != nil {
-			return errors.E(op, errors.Str("failed to initialize cache"), err)
-		}
-		p.cache = cache
-	} else {
-		p.log.Debug("cache disabled, all builds will go directly to Velox server")
-	}
-
-	p.log.Debug("plugin initialized",
+	p.log.Info("velox middleware initialized",
 		zap.String("server_url", p.cfg.ServerURL),
-		zap.Bool("cache_enabled", p.cfg.Cache.Enabled),
-		zap.Int("max_concurrent_builds", p.cfg.MaxConcurrentBuilds),
 		zap.Duration("build_timeout", p.cfg.BuildTimeout),
+		zap.Duration("request_timeout", p.cfg.RequestTimeout),
 	)
 
 	return nil
 }
 
-// Serve starts the plugin's background services.
-// This includes cache cleanup goroutines and index persistence.
-func (p *Plugin) Serve() chan error {
-	errCh := make(chan error, 1)
-
-	p.mu.Lock()
-	p.serving = true
-	p.mu.Unlock()
-
-	// Start cache background tasks if enabled
-	if p.cache != nil {
-		go p.cache.StartBackgroundTasks(p.stopCh)
-	}
-
-	p.log.Debug("plugin serving")
-
-	return errCh
-}
-
-// Stop gracefully shuts down the plugin.
-// This waits for active builds to complete and persists cache state.
-func (p *Plugin) Stop(ctx context.Context) error {
-	p.mu.Lock()
-	if !p.serving {
-		p.mu.Unlock()
-		return nil
-	}
-	p.serving = false
-	p.mu.Unlock()
-
-	close(p.stopCh)
-
-	// Wait for active builds to complete or context timeout
-	done := make(chan struct{})
-	go func() {
-		// Wait for semaphore to drain (all builds complete)
-		for p.sem.active() > 0 {
-			time.Sleep(100 * time.Millisecond)
-		}
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		p.log.Debug("all active builds completed")
-	case <-ctx.Done():
-		p.log.Warn("shutdown timeout reached, some builds may have been interrupted",
-			zap.Int("active_builds", p.sem.active()),
-		)
-	}
-
-	// Shutdown cache manager
-	if p.cache != nil {
-		if err := p.cache.Stop(ctx); err != nil {
-			p.log.Error("failed to stop cache manager", zap.Error(err))
-			return err
-		}
-	}
-
-	// Close Velox client
-	if err := p.client.Close(); err != nil {
-		p.log.Error("failed to close velox client", zap.Error(err))
-		return err
-	}
-
-	p.log.Debug("plugin stopped")
-	return nil
-}
-
-// Name returns the plugin name for registration in the Endure container.
-func (p *Plugin) Name() string {
-	return PluginName
-}
-
-// Weight returns the plugin weight for dependency resolution.
-// Higher weight means the plugin will be initialized/served later.
-// Velox needs to be initialized before HTTP plugin (weight 10).
-func (p *Plugin) Weight() uint {
-	return 9
-}
-
-// Middleware returns the HTTP middleware function that will be registered with RoadRunner's HTTP plugin.
-// This function intercepts responses from PHP workers and handles Velox build requests when detected.
-//
-// The middleware wraps the response writer to capture headers and body from PHP workers.
-// If a Velox build request is detected in the response, it intercepts and handles the build,
-// otherwise it passes the original response through to the client.
-//
-// The HTTP plugin will automatically discover and register this middleware if the plugin:
-// 1. Implements the Middleware(next http.Handler) http.Handler method
-// 2. Implements the Name() string method
-// 3. Is properly initialized in the Endure container
+// Middleware implements the HTTP middleware interface
 func (p *Plugin) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Create a response writer wrapper to capture PHP worker response
 		rrWriter := p.getWriter()
-		defer p.putWriter(rrWriter)
+		defer func() {
+			p.putWriter(rrWriter)
+			_ = r.Body.Close()
+		}()
 
-		// Pass request to PHP worker
+		// Process request through next handler
 		next.ServeHTTP(rrWriter, r)
 
-		// Check if PHP worker returned a Velox build request
-		if rrWriter.Header().Get(HeaderVeloxBuild) != "true" {
-			// Not a Velox request, pass through original response
-			p.passthroughResponse(w, rrWriter)
+		// Check for Velox build header
+		if rrWriter.Header().Get(xVeloxBuildHeader) == "" {
+			// Not a Velox build request, pass through
+			p.passThrough(w, rrWriter)
 			return
 		}
 
-		// Velox build request detected - intercept and handle
-		p.log.Debug("velox build request detected from PHP worker",
-			zap.String("path", r.URL.Path),
-			zap.String("method", r.Method),
-		)
-
-		// Handle Velox build request using the response body from PHP
-		p.handleVeloxBuild(w, r, rrWriter.data)
+		// Handle Velox build request
+		p.handleVeloxBuild(w, r, rrWriter)
 	})
 }
 
-// getWriter retrieves a response writer from the pool.
-func (p *Plugin) getWriter() *responseWriter {
-	return p.writersPool.Get().(*responseWriter)
-}
+// handleVeloxBuild processes Velox build requests
+func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWriter *writer) {
+	ctx := r.Context()
 
-// putWriter returns a response writer to the pool after resetting its state.
-func (p *Plugin) putWriter(w *responseWriter) {
-	w.code = http.StatusOK
-	w.data = w.data[:0] // Reset slice but keep capacity
+	// Delete the Velox header from response
+	rrWriter.Header().Del(xVeloxBuildHeader)
 
-	// Clear headers map
-	for k := range w.hdrToSend {
-		delete(w.hdrToSend, k)
+	// Decode response body if gzipped
+	data := rrWriter.data
+	if rrWriter.Header().Get("Content-Encoding") == "gzip" {
+		p.log.Debug("response is gzip-encoded, decompressing")
+
+		gzReader, err := gzip.NewReader(bytes.NewReader(rrWriter.data))
+		if err != nil {
+			p.log.Error("failed to create gzip reader",
+				zap.Error(err),
+			)
+			http.Error(w, "Failed to decompress gzipped response", http.StatusBadRequest)
+			return
+		}
+		defer gzReader.Close()
+
+		decompressed, err := io.ReadAll(gzReader)
+		if err != nil {
+			p.log.Error("failed to decompress gzip data",
+				zap.Error(err),
+			)
+			http.Error(w, "Failed to decompress gzipped response", http.StatusBadRequest)
+			return
+		}
+
+		data = decompressed
+		p.log.Debug("gzip decompression successful",
+			zap.Int("compressed_size", len(rrWriter.data)),
+			zap.Int("decompressed_size", len(data)),
+		)
 	}
 
-	p.writersPool.Put(w)
+	// Parse build request from response body
+	var buildReq BuildRequest
+	if err := json.Unmarshal(data, &buildReq); err != nil {
+		p.log.Error("failed to parse build request",
+			zap.Error(err),
+			zap.String("body", string(data)),
+		)
+		http.Error(w, "Invalid build request format", http.StatusBadRequest)
+		return
+	}
+
+	p.log.Info("processing velox build request",
+		zap.String("request_id", buildReq.RequestID),
+		zap.String("os", buildReq.TargetPlatform.OS),
+		zap.String("arch", buildReq.TargetPlatform.Arch),
+		zap.String("rr_version", buildReq.RRVersion),
+		zap.Int("plugins_count", len(buildReq.Plugins)),
+	)
+
+	// Build context with timeout
+	buildCtx, cancel := context.WithTimeout(ctx, p.cfg.BuildTimeout)
+	defer cancel()
+
+	// Send build request to Velox server
+	veloxResp, err := p.requestBuild(buildCtx, &buildReq)
+	if err != nil {
+		p.log.Error("velox build request failed",
+			zap.Error(err),
+			zap.String("request_id", buildReq.RequestID),
+		)
+
+		if errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "Build timeout exceeded", http.StatusGatewayTimeout)
+		} else {
+			http.Error(w, fmt.Sprintf("Build request failed: %v", err), http.StatusBadGateway)
+		}
+		return
+	}
+
+	// Check build success
+	if !veloxResp.Success {
+		p.log.Error("velox build failed",
+			zap.String("request_id", buildReq.RequestID),
+			zap.String("error", veloxResp.Error),
+			zap.String("code", veloxResp.Code),
+		)
+		http.Error(w, fmt.Sprintf("Build failed: %s", veloxResp.Error), http.StatusInternalServerError)
+		return
+	}
+
+	// Validate file path
+	if veloxResp.Path == "" {
+		p.log.Error("velox response missing file path",
+			zap.String("request_id", buildReq.RequestID),
+		)
+		http.Error(w, "Build response missing file path", http.StatusInternalServerError)
+		return
+	}
+
+	p.log.Info("velox build completed",
+		zap.String("request_id", buildReq.RequestID),
+		zap.String("build_id", veloxResp.BuildID),
+		zap.Int64("duration_ms", veloxResp.DurationMs),
+		zap.String("file_path", veloxResp.Path),
+	)
+
+	// Stream file to client
+	if err := p.streamFile(w, veloxResp.Path); err != nil {
+		p.log.Error("failed to stream file",
+			zap.Error(err),
+			zap.String("request_id", buildReq.RequestID),
+			zap.String("file_path", veloxResp.Path),
+		)
+		// Can't write error response after starting file stream
+		return
+	}
+
+	p.log.Info("file streamed successfully",
+		zap.String("request_id", buildReq.RequestID),
+		zap.String("file_path", veloxResp.Path),
+	)
 }
 
-// passthroughResponse writes the original PHP worker response to the client.
-// This is called when the response doesn't contain a Velox build request.
-func (p *Plugin) passthroughResponse(w http.ResponseWriter, rrWriter *responseWriter) {
-	// Copy all headers from PHP worker response
+// requestBuild sends a build request to Velox server with retry logic
+func (p *Plugin) requestBuild(ctx context.Context, buildReq *BuildRequest) (*VeloxResponse, error) {
+	const op = rrerrors.Op("velox_request_build")
+
+	// Marshal build request
+	payload, err := json.Marshal(buildReq)
+	if err != nil {
+		return nil, rrerrors.E(op, err)
+	}
+
+	var lastErr error
+	delay := p.cfg.Retry.InitialDelay
+
+	for attempt := 0; attempt < p.cfg.Retry.MaxAttempts; attempt++ {
+		if attempt > 0 {
+			// Wait before retry
+			select {
+			case <-ctx.Done():
+				return nil, rrerrors.E(op, ctx.Err())
+			case <-time.After(delay):
+			}
+
+			p.log.Warn("retrying velox build request",
+				zap.Int("attempt", attempt+1),
+				zap.Int("max_attempts", p.cfg.Retry.MaxAttempts),
+				zap.Duration("delay", delay),
+			)
+
+			// Calculate next delay with exponential backoff
+			delay = time.Duration(float64(delay) * p.cfg.Retry.BackoffMultiplier)
+			if delay > p.cfg.Retry.MaxDelay {
+				delay = p.cfg.Retry.MaxDelay
+			}
+		}
+
+		// Create HTTP request
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.ServerURL, bytes.NewReader(payload))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		req.Header.Set("Content-Type", ContentTypeJSON)
+
+		// Send request
+		resp, err := p.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Read response body
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Check HTTP status
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("velox server returned status %d: %s", resp.StatusCode, string(body))
+			continue
+		}
+
+		// Parse response
+		var veloxResp VeloxResponse
+		if err := json.Unmarshal(body, &veloxResp); err != nil {
+			lastErr = fmt.Errorf("failed to parse velox response: %w", err)
+			continue
+		}
+
+		// Success
+		return &veloxResp, nil
+	}
+
+	return nil, rrerrors.E(op, fmt.Errorf("all retry attempts failed: %w", lastErr))
+}
+
+// streamFile streams a file to the HTTP response writer
+func (p *Plugin) streamFile(w http.ResponseWriter, filePath string) error {
+	const op = rrerrors.Op("velox_stream_file")
+
+	// Security check: prevent path traversal
+	if strings.Contains(filePath, "..") {
+		return rrerrors.E(op, fmt.Errorf("invalid file path: contains '..'"))
+	}
+
+	// Check if file exists
+	fs, err := os.Stat(filePath)
+	if err != nil {
+		return rrerrors.E(op, err)
+	}
+
+	// Open file for reading
+	f, err := os.OpenFile(filePath, os.O_RDONLY, 0)
+	if err != nil {
+		return rrerrors.E(op, err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	// Set response headers
+	w.Header().Set("Content-Type", ContentTypeOctetStream)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fs.Size()))
+	w.WriteHeader(http.StatusOK)
+
+	size := fs.Size()
+	var buf []byte
+
+	// Allocate buffer based on file size
+	if size < int64(bufSize) {
+		// Small file: allocate exact size
+		buf = make([]byte, size)
+	} else {
+		// Large file: use fixed 10MB buffer
+		buf = make([]byte, bufSize)
+	}
+
+	off := 0
+	for {
+		n, err := f.ReadAt(buf, int64(off))
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if n > 0 {
+					goto write
+				}
+				break
+			}
+			return rrerrors.E(op, err)
+		}
+
+	write:
+		buf = buf[:n]
+		_, err = w.Write(buf)
+		if err != nil {
+			return rrerrors.E(op, err)
+		}
+
+		// Flush data to client
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		off += n
+	}
+
+	return nil
+}
+
+// passThrough writes the original response from PHP worker to the client
+func (p *Plugin) passThrough(w http.ResponseWriter, rrWriter *writer) {
+	// Copy all headers
 	for k := range rrWriter.hdrToSend {
 		for _, v := range rrWriter.hdrToSend[k] {
 			w.Header().Add(k, v)
@@ -258,7 +422,29 @@ func (p *Plugin) passthroughResponse(w http.ResponseWriter, rrWriter *responseWr
 	if len(rrWriter.data) > 0 {
 		_, err := w.Write(rrWriter.data)
 		if err != nil {
-			p.log.Error("failed to write passthrough response", zap.Error(err))
+			p.log.Error("failed to write response data", zap.Error(err))
 		}
 	}
+}
+
+// Name returns the plugin name
+func (p *Plugin) Name() string {
+	return PluginName
+}
+
+// getWriter retrieves a writer from the pool
+func (p *Plugin) getWriter() *writer {
+	return p.writersPool.Get().(*writer)
+}
+
+// putWriter returns a writer to the pool
+func (p *Plugin) putWriter(w *writer) {
+	w.code = http.StatusOK
+	w.data = make([]byte, 0, 10)
+
+	for k := range w.hdrToSend {
+		delete(w.hdrToSend, k)
+	}
+
+	p.writersPool.Put(w)
 }

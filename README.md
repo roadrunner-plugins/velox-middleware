@@ -1,604 +1,280 @@
-# Velox Plugin
+# Velox Middleware Plugin
 
-A high-performance RoadRunner HTTP middleware plugin that intercepts Velox binary build requests from PHP workers, manages
-intelligent caching with LRU eviction, and streams binaries directly to clients without blocking expensive PHP worker
-processes.
+A RoadRunner middleware plugin that offloads Velox binary builds from PHP workers to Go, enabling non-blocking builds
+with direct file streaming to clients.
 
 ## Overview
 
-The Velox middleware plugin solves a critical performance problem: PHP workers blocking for 1+ minutes during Velox
-binary builds. This plugin intercepts special HTTP responses containing build requests, immediately releases the PHP
-worker, and handles the entire build-cache-stream lifecycle in Go.
+The Velox middleware plugin intercepts HTTP responses from PHP workers that contain build requests, immediately releases
+the worker, delegates the build to a Velox server, and streams the resulting binary directly to the HTTP client.
 
-### Key Features
+## Features
 
-- **Worker Efficiency**: PHP workers released immediately (< 100ms) instead of blocking for minutes
-- **Intelligent Caching**: SHA256-based content-addressable cache with configurable TTL and LRU eviction
-- **Concurrent Builds**: Semaphore-limited concurrent builds with configurable max (default: 5)
-- **Retry Logic**: Exponential backoff retry for transient Velox server failures
-- **Comprehensive Metrics**: 20+ Prometheus metrics for monitoring cache effectiveness, build performance, and errors
-- **Graceful Shutdown**: Waits for active builds to complete before shutdown
-- **Production Ready**: Extensive error handling, structured logging, and observability
-- **Automatic Registration**: Middleware automatically discovered and registered by HTTP plugin
-
-## Architecture
-
-```
-┌─────────────┐
-│ PHP Worker  │ (Sends build request with X-Velox-Build header)
-└──────┬──────┘
-       │
-       ▼
-┌──────────────────────────────────────────────────────────┐
-│                     Velox Plugin                         │
-│  (HTTP Middleware - automatically registered)            │
-│                                                           │
-│  1. Parse build request from response body               │
-│  2. Generate cache key (SHA256 of normalized config)     │
-│  3. Check cache (if not force_rebuild)                   │
-│     ├─ HIT  → Stream cached binary to client             │
-│     └─ MISS → Acquire semaphore slot                     │
-│                └─ Call Velox server                      │
-│                   └─ Stream to client + cache            │
-└──────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌─────────────┐
-│   Client    │ (Receives binary stream)
-└─────────────┘
-```
+- **Non-blocking PHP Workers**: Workers are freed immediately after sending build parameters (< 100ms vs ~60s)
+- **Direct File Streaming**: Binaries stream directly from filesystem to client using efficient 10MB chunking
+- **Retry Logic**: Configurable exponential backoff for Velox server communication
+- **Context Propagation**: Client disconnects properly cancel ongoing builds
+- **Security**: Path traversal protection for file streaming
+- **Efficient Buffering**: Smart buffer allocation based on file size
 
 ## Configuration
 
-### Plugin Registration
-
-This plugin can be registered with RoadRunner's HTTP plugin in two ways:
-
-#### 1. Manual Registration (Recommended)
-
-Explicitly list the plugin in HTTP middleware configuration:
+Add to your `.rr.yaml`:
 
 ```yaml
-http:
-  address: 0.0.0.0:8080
-  middleware: ["velox"]  # Explicit middleware registration
-
 velox:
+  # Velox build server endpoint (required)
   server_url: "http://127.0.0.1:9000"
-```
 
-This gives you full control over middleware order and ensures the plugin is only active when explicitly enabled.
+  # Build timeout - maximum time to wait for build completion (default: 5m)
+  build_timeout: "5m"
 
-#### 2. Automatic Discovery
-
-If no middleware list is specified, the HTTP plugin discovers all plugins implementing the middleware interface:
-
-```yaml
-http:
-  address: 0.0.0.0:8080
-  # No middleware: [] - automatic discovery
-
-velox:
-  server_url: "http://127.0.0.1:9000"
-```
-
-**Note:** For production environments, manual registration is recommended for predictable behavior.
-
-### Minimal Configuration
-
-```yaml
-http:
-  address: 0.0.0.0:8080
-  middleware: ["velox"]
-
-velox:
-  server_url: "http://127.0.0.1:9000"
-```
-
-### Full Configuration
-
-```yaml
-http:
-  address: 0.0.0.0:8080
-  middleware: ["gzip", "velox", "sendfile"]  # Middleware execution order
-
-velox:
-  # Velox server endpoint (required)
-  server_url: "http://velox.internal.company.com:9000"
-
-  # Build timeout (default: 5m)
-  build_timeout: "10m"
-
-  # Maximum concurrent builds (default: 5)
-  max_concurrent_builds: 10
-
-  # Request timeout for Velox server communication (default: 10s)
-  request_timeout: "30s"
-
-  # Cache configuration
-  cache:
-    # Enable caching (default: true)
-    enabled: true
-
-    # Cache directory path (default: ./.rr-cache/velox-binaries)
-    dir: "/var/cache/roadrunner/velox"
-
-    # Cache TTL in days (default: 7)
-    ttl_days: 14
-
-    # Maximum cache size in MB (default: 5000 = 5GB)
-    # When exceeded, oldest binaries are removed (LRU)
-    max_size_mb: 10000
-
-    # Cleanup interval - how often to check for expired entries (default: 1h)
-    cleanup_interval: "30m"
+  # Request timeout - HTTP timeout for Velox communication (default: 180s)
+  request_timeout: "180s"
 
   # Retry configuration
   retry:
-    max_attempts: 5
-    initial_delay: "2s"
-    max_delay: "30s"
+    # Maximum retry attempts (default: 3)
+    max_attempts: 3
+
+    # Initial delay before first retry (default: 1s)
+    initial_delay: "1s"
+
+    # Maximum delay between retries (default: 10s)
+    max_delay: "10s"
+
+    # Backoff multiplier for exponential backoff (default: 2.0)
+    backoff_multiplier: 2.0
 ```
-
-### Cache Disabled
-
-```yaml
-velox:
-  server_url: "http://127.0.0.1:9000"
-
-  cache:
-    enabled: false
-```
-
-### Integration with Other Plugins
-
-Middleware execution order is controlled by the `middleware` list:
-
-```yaml
-# .rr.yaml
-version: "3"
-
-# HTTP plugin with explicit middleware registration
-http:
-  address: 0.0.0.0:8080
-  
-  # Middleware execution order (left to right)
-  # Request flow: gzip → velox → sendfile → PHP workers
-  middleware: ["gzip", "velox", "sendfile"]
-
-# Velox plugin configuration  
-velox:
-  server_url: "http://velox-server:9000"
-  max_concurrent_builds: 10
-  cache:
-    enabled: true
-    max_size_mb: 10000
-
-# Metrics plugin for Prometheus integration
-metrics:
-  address: 0.0.0.0:2112
-
-# Other plugins work normally
-rpc:
-  listen: tcp://127.0.0.1:6001
-
-# Logs plugin
-logs:
-  mode: production
-  level: info
-```
-
-### Middleware Order Matters
-
-```yaml
-# Example 1: Velox before sendfile
-http:
-  middleware: ["velox", "sendfile"]
-# If X-Velox-Build header present → Velox handles it
-# Otherwise → request passes to sendfile → PHP workers
-
-# Example 2: Sendfile before velox (not recommended)
-http:
-  middleware: ["sendfile", "velox"]
-# Sendfile checks response first, then velox
-# This may cause issues if both headers are present
-```
-
-**Best Practice:** Place `velox` middleware early in the chain since it intercepts requests before they reach PHP workers.
 
 ## PHP Integration
 
-### Building a Binary
+### Triggering a Velox Build
+
+From your PHP worker, return a response with the `X-Velox-Build` header and a JSON payload:
 
 ```php
 <?php
 
-namespace App\Http\Controllers;
+use Spiral\RoadRunner\Http\Request;
+use Spiral\RoadRunner\Http\Response;
 
-use Illuminate\Http\JsonResponse;
-use Ramsey\Uuid\Uuid;
-
-class VeloxBuildController extends Controller
-{
-    public function build(): JsonResponse
-    {
-        $buildRequest = [
-            'request_id' => Uuid::uuid4()->toString(),
-            'force_rebuild' => false, // Use cache if available
-            'target_platform' => [
-                'os' => 'linux',
-                'arch' => 'amd64',
-            ],
-            'rr_version' => 'v2025.1.2',
-            'plugins' => [
-                [
-                    'module_name' => 'github.com/roadrunner-server/http/v5',
-                    'tag' => 'v5.2.7',
-                ],
-                [
-                    'module_name' => 'github.com/roadrunner-server/grpc/v5',
-                    'tag' => 'v5.1.0',
-                ],
-            ],
-        ];
-
-        return response()
-            ->json($buildRequest)
-            ->header('X-Velox-Build', 'true');
-    }
-}
-```
-
-### Force Rebuild
-
-Set `force_rebuild: true` to bypass cache and always build from Velox server:
-
-```php
+// Build request parameters
 $buildRequest = [
-    'request_id' => Uuid::uuid4()->toString(),
-    'force_rebuild' => true, // Always build fresh
-    // ... rest of config
+    'request_id' => 'b66d5617-64dd-419b-a68b-b002938320ab',
+    'target_platform' => [
+        'os' => 'windows',
+        'arch' => 'amd64',
+    ],
+    'rr_version' => 'v2025.1.2',
+    'plugins' => [
+        [
+            'module_name' => 'github.com/roadrunner-server/http/v5',
+            'tag' => 'v5.2.7',
+        ],
+        [
+            'module_name' => 'github.com/roadrunner-server/grpc/v5',
+            'tag' => 'v5.1.0',
+        ],
+    ],
 ];
+
+// Return response with Velox header
+return new Response(
+    status: 200,
+    headers: [
+        'X-Velox-Build' => 'true',
+        'Content-Type' => 'application/json',
+    ],
+    body: json_encode($buildRequest)
+);
 ```
 
-## Cache Architecture
+### Response Flow
 
-### Cache Key Generation
+1. PHP worker sends response with `X-Velox-Build` header
+2. Velox middleware intercepts the response
+3. Worker is immediately released back to the pool
+4. Middleware sends build request to Velox server
+5. Velox server builds the binary and returns file path
+6. Middleware streams binary directly to HTTP client
 
-Cache keys are generated using SHA256 hash of normalized build configuration:
+## Protocol
 
-1. **Extract Fields**: `rr_version`, `os`, `arch`, `plugins[]`
-2. **Normalize**: Sort plugins alphabetically, lowercase all strings, remove whitespace
-3. **Hash**: Compute SHA256 hash of canonical JSON representation
-4. **Truncate**: Use first 16 characters as cache key
-
-Example:
-
-```
-Config: RR v2025.1.2, linux/amd64, http+grpc
-Cache Key: a3f5d8c2e9b1f4a7
-```
-
-### Filesystem Structure
-
-Hierarchical directory structure prevents too many files in single directory:
-
-```
-.rr-cache/velox-binaries/
-├── index.json                          # Cache metadata index
-├── a3/                                 # First 2 chars of hash
-│   └── f5/                            # Next 2 chars of hash
-│       └── a3f5d8c2e9b1f4a7.bin      # Cached binary
-├── b7/
-│   └── e2/
-│       └── b7e2c9d4f1a8e3b6.bin
-└── c9/
-    └── f8/
-        └── c9f8a3e1b7d2f5a4.bin
-```
-
-### Cache Index
-
-In-memory index with LRU tracking for fast lookups:
+### Build Request Format
 
 ```json
 {
-  "version": 1,
-  "entries": {
-    "a3f5d8c2e9b1f4a7": {
-      "file_path": "a3/f5/a3f5d8c2e9b1f4a7.bin",
-      "file_size": 52428800,
-      "created_at": "2025-11-13T10:30:00Z",
-      "expires_at": "2025-11-20T10:30:00Z",
-      "accessed_at": "2025-11-13T15:45:00Z",
-      "build_config": {
-        "rr_version": "v2025.1.2",
-        "os": "linux",
-        "arch": "amd64",
-        "plugins": [
-          ...
-        ]
-      }
+  "request_id": "b66d5617-64dd-419b-a68b-b002938320ab",
+  "target_platform": {
+    "os": "windows",
+    "arch": "amd64"
+  },
+  "rr_version": "v2025.1.2",
+  "plugins": [
+    {
+      "module_name": "github.com/roadrunner-server/http/v5",
+      "tag": "v5.2.7"
     }
-  }
+  ]
 }
 ```
 
-### Cache Eviction
+### Velox Server Response Format
 
-**Time-based (TTL):**
-
-- Default: 7 days from creation
-- Configurable via `cache.ttl_days`
-- Background goroutine removes expired entries every `cleanup_interval`
-
-**Size-based (LRU):**
-
-- Max cache size: configurable (default: 5GB)
-- When exceeded, remove least recently used entries
-- Access time updated on cache hits
-
-## Metrics
-
-### Cache Metrics
-
-```promql
-# Cache hit rate (last 1h)
-sum(rate(velox_cache_hits_total[1h])) / 
-(sum(rate(velox_cache_hits_total[1h])) + sum(rate(velox_cache_misses_total[1h])))
-
-# Cache size growth rate (bytes per hour)
-rate(velox_cache_size_bytes[1h]) * 3600
-
-# Cache evictions by reason
-rate(velox_cache_evictions_total[5m])
-```
-
-### Build Metrics
-
-```promql
-# P50/P95/P99 build duration
-histogram_quantile(0.50, rate(velox_build_duration_seconds_bucket[5m]))
-histogram_quantile(0.95, rate(velox_build_duration_seconds_bucket[5m]))
-histogram_quantile(0.99, rate(velox_build_duration_seconds_bucket[5m]))
-
-# Active builds
-velox_builds_active
-
-# Build success rate
-sum(rate(velox_builds_total{status="success"}[5m])) / 
-sum(rate(velox_builds_total[5m]))
-```
-
-### Error Metrics
-
-```promql
-# Error rate by type
-sum(rate(velox_errors_total[5m])) by (type)
-
-# Build timeout rate
-rate(velox_builds_total{status="timeout"}[5m])
-```
-
-### Available Metrics
-
-**Cache:**
-
-- `velox_cache_hits_total` - Total cache hits
-- `velox_cache_misses_total` - Total cache misses
-- `velox_cache_evictions_total{reason}` - Evictions by reason (expired/lru)
-- `velox_cache_entries_count` - Current cache entries
-- `velox_cache_size_bytes` - Current cache size
-- `velox_cache_access_age_seconds` - Most recent cache access age
-
-**Builds:**
-
-- `velox_builds_total{status,cache_status}` - Total builds by status
-- `velox_force_rebuilds_total` - Total force rebuilds
-- `velox_builds_active` - Active builds
-- `velox_build_duration_seconds{os,arch}` - Build duration histogram
-- `velox_binary_size_bytes{os,arch}` - Binary size histogram
-
-**Errors:**
-
-- `velox_errors_total{type}` - Errors by type
-- `velox_retries_total{reason}` - Retry attempts by reason
-
-**Streaming:**
-
-- `velox_stream_ttfb_seconds{cache_status}` - Time to first byte
-- `velox_client_disconnects_total{stage}` - Client disconnects by stage
-
-## Response Headers
-
-### Successful Cache Hit
-
-```
-HTTP/1.1 200 OK
-Content-Type: application/octet-stream
-Content-Disposition: attachment; filename="roadrunner-linux-amd64"
-Content-Length: 52428800
-X-Build-Request-ID: b66d5617-64dd-419b-a68b-b002938320ab
-X-Cache-Status: HIT
-X-Cache-Age: 3600
-
-[binary data stream]
-```
-
-### Successful Cache Miss
-
-```
-HTTP/1.1 200 OK
-Content-Type: application/octet-stream
-Content-Disposition: attachment; filename="roadrunner-windows-amd64.exe"
-X-Build-Request-ID: b66d5617-64dd-419b-a68b-b002938320ab
-X-Cache-Status: MISS
-X-Build-Time: 58.3
-
-[binary data stream]
-```
-
-### Error Responses
-
-**Validation Error (400):**
+**Success:**
 
 ```json
 {
-  "error": "invalid_request",
-  "message": "missing required field: rr_version",
-  "request_id": "b66d5617-64dd-419b-a68b-b002938320ab"
+  "success": true,
+  "path": "/tmp/velox/builds/roadrunner-windows-amd64-abc123.exe",
+  "build_id": "abc123def456",
+  "duration_ms": 58234
 }
 ```
 
-**Build Failure (502):**
+**Failure:**
 
 ```json
 {
-  "error": "build_failed",
-  "message": "velox server returned: plugin version conflict",
-  "request_id": "b66d5617-64dd-419b-a68b-b002938320ab"
+  "success": false,
+  "error": "failed to compile plugin: github.com/invalid/plugin",
+  "code": "BUILD_ERROR"
 }
 ```
 
-**Timeout (504):**
+## Architecture
 
-```json
-{
-  "error": "timeout",
-  "message": "build exceeded 5m timeout",
-  "request_id": "b66d5617-64dd-419b-a68b-b002938320ab"
-}
+### Request Flow
+
+```
+┌──────────┐     ┌──────────┐     ┌────────┐     ┌───────┐
+│  Client  │────▶│ RR HTTP  │────▶│  PHP   │────▶│ Velox │
+│          │     │          │     │ Worker │     │Plugin │
+└──────────┘     └──────────┘     └────────┘     └───────┘
+                                       │              │
+                                       │Released      │
+                                       │immediately   │
+                                       ▼              ▼
+                                  ┌──────────────────────┐
+                                  │   Send to Velox      │
+                                  │   Build Server       │
+                                  └──────────────────────┘
+                                              │
+                                              ▼
+                                  ┌──────────────────────┐
+                                  │  Stream Binary File  │
+                                  │  to Client           │
+                                  └──────────────────────┘
+```
+
+### Key Design Decisions
+
+**Writer Pooling**: Response writers are pooled to reduce garbage collection pressure during high traffic.
+
+**Chunked Streaming**: Files are streamed in 10MB chunks with automatic flushing for progressive downloads.
+
+**Smart Buffer Allocation**: Small files use exact-size buffers, large files use fixed 10MB buffers to prevent memory
+spikes.
+
+**Context Propagation**: Client disconnects trigger context cancellation, aborting ongoing Velox requests.
+
+**Retry with Backoff**: Failed Velox requests retry with exponential backoff up to configured maximum.
+
+## Error Handling
+
+### HTTP Status Codes
+
+- `400 Bad Request`: Invalid JSON payload from PHP worker
+- `502 Bad Gateway`: Velox server unreachable or returned error
+- `504 Gateway Timeout`: Build exceeded configured timeout
+- `500 Internal Server Error`: Build failed or file streaming error
+
+### Logging
+
+All operations are logged with structured context:
+
+```go
+p.log.Info("velox build completed",
+zap.String("request_id", buildReq.RequestID),
+zap.String("build_id", veloxResp.BuildID),
+zap.Int64("duration_ms", veloxResp.DurationMs),
+zap.String("file_path", veloxResp.Path),
+)
 ```
 
 ## Performance Characteristics
 
-### Worker Release Time
+- **Worker Release Time**: < 100ms (vs ~60s for synchronous builds)
+- **Memory Usage**: ~10MB per concurrent build request (for buffer)
+- **Concurrent Builds**: Limited only by Velox server capacity
+- **File Streaming**: Zero-copy streaming from disk to network
 
-- **Target**: < 100ms
-- **Actual**: Typically 20-50ms (parse request + cache lookup + spawn goroutine)
-- PHP workers freed immediately, no 1-minute blocking
+## Security
 
-### Cache Hit Response Time
-
-- **Typical**: < 1 second
-- **Operations**: Cache lookup (O(1)), file open, stream to client
-- 70-80% cache hit rate expected in production
-
-### Cache Miss Build Time
-
-- **Typical**: 30-90 seconds (depends on Velox server, build complexity)
-- **Concurrent**: Up to `max_concurrent_builds` simultaneous builds
-- Retry logic handles transient failures
-
-### Resource Usage
-
-- **Memory**: ~5MB for cache index (10,000 entries)
-- **Disk**: Configurable (default: 5GB max)
-- **Goroutines**: 1 per active build + 2 background tasks
-
-## Error Handling
-
-### Retry Logic
-
-- **Retryable**: Connection timeouts, 5xx server errors
-- **Non-retryable**: Validation errors (4xx), context cancellation
-- **Strategy**: Exponential backoff (1s → 2s → 4s → 8s → 10s max)
-- **Max attempts**: Configurable (default: 3)
-
-### Cache Failures
-
-- Cache read failures are logged but don't fail the request
-- Cache write failures are logged but don't prevent streaming to client
-- Partial builds are never cached (atomic write with temp file + rename)
-
-### Graceful Degradation
-
-- If cache disabled or unavailable, all requests go to Velox server
-- If Velox server unavailable, returns appropriate error to client
-- Client disconnects cancel ongoing builds and free resources
-
-## Logging
-
-### Log Levels
-
-**DEBUG**: Cache operations, streaming progress
-**INFO**: Build lifecycle, cache hits/misses, cleanup operations
-**WARN**: Cache failures, retry attempts, client disconnects
-**ERROR**: Build failures, configuration issues, unrecoverable errors
-
-### Structured Logging Examples
-
-```
-INFO    build request received
-        request_id=b66d5617-64dd-419b-a68b-b002938320ab
-        os=linux arch=amd64 rr_version=v2025.1.2
-        plugins_count=2 force_rebuild=false
-
-INFO    cache hit
-        request_id=b66d5617-64dd-419b-a68b-b002938320ab
-        cache_key=a3f5d8c2e9b1f4a7
-        cache_age=1h15m file_size=52428800
-
-INFO    build completed
-        request_id=b66d5617-64dd-419b-a68b-b002938320ab
-        build_duration=58.3s bytes_written=52428800
-
-INFO    cache cleanup completed
-        expired_removed=5 lru_removed=2
-        duration=125ms entries_remaining=47
-```
+- **Path Traversal Protection**: Rejects file paths containing `..`
+- **No Arbitrary File Access**: Only streams files explicitly returned by Velox server
+- **Timeout Protection**: All operations bounded by configurable timeouts
 
 ## Troubleshooting
 
-### High Cache Miss Rate
+### Build requests not detected
 
-**Symptoms**: `velox_cache_hits_total / velox_cache_misses_total < 0.5`
+**Check:**
 
-**Causes**:
+- PHP worker sends `X-Velox-Build: true` header
+- Response body is valid JSON
+- Plugin is enabled in `.rr.yaml`
+- Plugin loaded in RoadRunner middleware chain
 
-- TTL too short (increase `cache.ttl_days`)
-- Cache size too small (increase `cache.max_size_mb`)
-- Frequent `force_rebuild` requests
-- High variety of build configurations
+### Velox server connection failures
 
-### Build Timeouts
+**Check:**
 
-**Symptoms**: `velox_builds_total{status="timeout"}` increasing
+- `server_url` is correct and reachable
+- Velox server is running and healthy
+- Network connectivity between RR and Velox
+- Request timeout is sufficient for network latency
 
-**Solutions**:
+### File streaming failures
 
-- Increase `build_timeout` (default: 5m)
-- Check Velox server performance
-- Review network connectivity
+**Check:**
 
-### Cache Size Growing Too Fast
+- Velox server returns absolute file path
+- File exists and is readable
+- File permissions allow read access
+- Disk I/O is not bottlenecked
 
-**Symptoms**: `velox_cache_evictions_total{reason="lru"}` increasing rapidly
+## Development
 
-**Solutions**:
+### Building
 
-- Increase `cache.max_size_mb`
-- Decrease `cache.ttl_days`
-- Consider using dedicated disk/partition
+```bash
+cd velox-middleware
+go mod tidy
+go build
+```
 
-### PHP Workers Still Blocking
+### Testing
 
-**Symptoms**: PHP workers not immediately freed
+```bash
+go test -v ./...
+```
 
-**Causes**:
+### Integration with RoadRunner
 
-- `X-Velox-Build` header not set to `"true"` (case-sensitive)
-- Invalid JSON in response body
-- Middleware not properly registered
+Register the plugin in your RoadRunner build:
+
+```go
+import "github.com/roadrunner-plugins/velox-middleware"
+
+// In your container initialization
+err := container.Register(&velox.Plugin{})
+if err != nil {
+panic(err)
+}
+```
 
 ## License
 
-MIT License
-
-## Contributing
-
-Contributions welcome! Please open an issue or pull request.
-
-## Support
-
-For issues, questions, or feature requests, please open an issue on GitHub.
+MIT License - see LICENSE file for details

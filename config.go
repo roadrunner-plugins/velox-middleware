@@ -1,179 +1,154 @@
-package veloxmiddleware
+package velox
 
 import (
 	"fmt"
 	"time"
 
-	"github.com/roadrunner-server/errors"
+	rrerrors "github.com/roadrunner-server/errors"
 )
 
-// Config represents the Velox middleware plugin configuration.
+// Config holds the plugin configuration
 type Config struct {
-	// ServerURL is the Velox server endpoint (required)
+	// ServerURL is the Velox build server endpoint (required)
 	ServerURL string `mapstructure:"server_url"`
 
-	// BuildTimeout is the maximum duration for a build operation
+	// BuildTimeout is the maximum time to wait for build completion (default: 5m)
 	BuildTimeout time.Duration `mapstructure:"build_timeout"`
 
-	// MaxConcurrentBuilds limits the number of concurrent builds
-	MaxConcurrentBuilds int `mapstructure:"max_concurrent_builds"`
-
-	// RequestTimeout is the timeout for Velox server HTTP requests
+	// RequestTimeout is the HTTP request timeout for Velox communication (default: 180s)
 	RequestTimeout time.Duration `mapstructure:"request_timeout"`
 
-	// Cache configuration
-	Cache CacheConfig `mapstructure:"cache"`
-
-	// Retry configuration
+	// Retry configuration for Velox server communication
 	Retry RetryConfig `mapstructure:"retry"`
 }
 
-// CacheConfig represents cache-related configuration.
-type CacheConfig struct {
-	// Enabled enables or disables caching
-	Enabled bool `mapstructure:"enabled"`
-
-	// Dir is the cache directory path
-	Dir string `mapstructure:"dir"`
-
-	// TTLDays is the cache entry time-to-live in days
-	TTLDays int `mapstructure:"ttl_days"`
-
-	// MaxSizeMB is the maximum cache size in megabytes
-	MaxSizeMB int64 `mapstructure:"max_size_mb"`
-
-	// CleanupInterval is how often to run cache cleanup
-	CleanupInterval time.Duration `mapstructure:"cleanup_interval"`
-}
-
-// RetryConfig represents retry-related configuration.
+// RetryConfig holds retry configuration
 type RetryConfig struct {
-	// MaxAttempts is the maximum number of retry attempts
+	// MaxAttempts is the maximum number of retry attempts (default: 3)
 	MaxAttempts int `mapstructure:"max_attempts"`
 
-	// InitialDelay is the initial delay before first retry
+	// InitialDelay is the initial delay before first retry (default: 1s)
 	InitialDelay time.Duration `mapstructure:"initial_delay"`
 
-	// MaxDelay is the maximum delay between retries
+	// MaxDelay is the maximum delay between retries (default: 10s)
 	MaxDelay time.Duration `mapstructure:"max_delay"`
+
+	// BackoffMultiplier is the backoff multiplier for exponential backoff (default: 2.0)
+	BackoffMultiplier float64 `mapstructure:"backoff_multiplier"`
 }
 
-// Validate validates the configuration and sets defaults.
-func (c *Config) Validate() error {
-	const op = errors.Op("velox_middleware_config_validate")
-
-	// Validate ServerURL (required)
-	if c.ServerURL == "" {
-		return errors.E(op, errors.Str("server_url is required"))
-	}
-
-	// Set defaults for build timeout
+// InitDefaults sets default values for the configuration
+func (c *Config) InitDefaults() {
 	if c.BuildTimeout == 0 {
 		c.BuildTimeout = 5 * time.Minute
 	}
 
-	// Set defaults for max concurrent builds
-	if c.MaxConcurrentBuilds == 0 {
-		c.MaxConcurrentBuilds = 5
-	}
-	if c.MaxConcurrentBuilds < 1 {
-		return errors.E(op, errors.Str("max_concurrent_builds must be at least 1"))
-	}
-
-	// Set defaults for request timeout
 	if c.RequestTimeout == 0 {
-		c.RequestTimeout = 10 * time.Second
+		c.RequestTimeout = 180 * time.Second
 	}
 
-	// Validate cache configuration
-	if err := c.Cache.validate(); err != nil {
-		return errors.E(op, err)
+	if c.Retry.MaxAttempts == 0 {
+		c.Retry.MaxAttempts = 3
 	}
 
-	// Validate retry configuration
-	if err := c.Retry.validate(); err != nil {
-		return errors.E(op, err)
+	if c.Retry.InitialDelay == 0 {
+		c.Retry.InitialDelay = 1 * time.Second
+	}
+
+	if c.Retry.MaxDelay == 0 {
+		c.Retry.MaxDelay = 10 * time.Second
+	}
+
+	if c.Retry.BackoffMultiplier == 0 {
+		c.Retry.BackoffMultiplier = 2.0
+	}
+}
+
+// Validate validates the configuration
+func (c *Config) Validate() error {
+	const op = rrerrors.Op("velox_config_validate")
+
+	if c.ServerURL == "" {
+		return rrerrors.E(op, fmt.Errorf("server_url is required"))
+	}
+
+	if c.BuildTimeout < time.Second {
+		return rrerrors.E(op, fmt.Errorf("build_timeout must be at least 1 second"))
+	}
+
+	if c.RequestTimeout < time.Second {
+		return rrerrors.E(op, fmt.Errorf("request_timeout must be at least 1 second"))
+	}
+
+	if c.Retry.MaxAttempts < 1 {
+		return rrerrors.E(op, fmt.Errorf("retry.max_attempts must be at least 1"))
+	}
+
+	if c.Retry.InitialDelay < 0 {
+		return rrerrors.E(op, fmt.Errorf("retry.initial_delay cannot be negative"))
+	}
+
+	if c.Retry.MaxDelay < c.Retry.InitialDelay {
+		return rrerrors.E(op, fmt.Errorf("retry.max_delay must be greater than or equal to initial_delay"))
+	}
+
+	if c.Retry.BackoffMultiplier < 1.0 {
+		return rrerrors.E(op, fmt.Errorf("retry.backoff_multiplier must be at least 1.0"))
 	}
 
 	return nil
 }
 
-// validate validates cache configuration and sets defaults.
-func (cc *CacheConfig) validate() error {
-	const op = errors.Op("cache_config_validate")
+// BuildRequest represents the build request from PHP
+type BuildRequest struct {
+	// RequestID is a unique identifier for the build request
+	RequestID string `json:"request_id"`
 
-	// Cache is enabled by default
-	if !cc.Enabled {
-		// No further validation needed if cache is disabled
-		return nil
-	}
+	// TargetPlatform specifies the target OS and architecture
+	TargetPlatform Platform `json:"target_platform"`
 
-	// Set default cache directory
-	if cc.Dir == "" {
-		cc.Dir = "./.rr-cache/velox-binaries"
-	}
+	// RRVersion is the RoadRunner version to build
+	RRVersion string `json:"rr_version"`
 
-	// Set default TTL
-	if cc.TTLDays == 0 {
-		cc.TTLDays = 7
-	}
-	if cc.TTLDays < 0 {
-		return errors.E(op, errors.Str("ttl_days must be positive"))
-	}
-
-	// Set default max size
-	if cc.MaxSizeMB == 0 {
-		cc.MaxSizeMB = 5000 // 5GB
-	}
-	if cc.MaxSizeMB < 100 {
-		return errors.E(op, errors.Str("max_size_mb must be at least 100MB"))
-	}
-
-	// Set default cleanup interval
-	if cc.CleanupInterval == 0 {
-		cc.CleanupInterval = 1 * time.Hour
-	}
-	if cc.CleanupInterval < 1*time.Minute {
-		return errors.E(op, errors.Str("cleanup_interval must be at least 1 minute"))
-	}
-
-	return nil
+	// Plugins is the list of plugins to include in the build
+	Plugins []Plugin `json:"plugins"`
 }
 
-// validate validates retry configuration and sets defaults.
-func (rc *RetryConfig) validate() error {
-	const op = errors.Op("retry_config_validate")
+// Platform represents the target platform
+type Platform struct {
+	// OS is the target operating system (windows, linux, darwin)
+	OS string `json:"os"`
 
-	// Set default max attempts
-	if rc.MaxAttempts == 0 {
-		rc.MaxAttempts = 3
-	}
-	if rc.MaxAttempts < 1 {
-		return errors.E(op, errors.Str("max_attempts must be at least 1"))
-	}
-
-	// Set default initial delay
-	if rc.InitialDelay == 0 {
-		rc.InitialDelay = 1 * time.Second
-	}
-
-	// Set default max delay
-	if rc.MaxDelay == 0 {
-		rc.MaxDelay = 10 * time.Second
-	}
-	if rc.MaxDelay < rc.InitialDelay {
-		return errors.E(op, fmt.Errorf("max_delay (%v) must be >= initial_delay (%v)", rc.MaxDelay, rc.InitialDelay))
-	}
-
-	return nil
+	// Arch is the target architecture (amd64, arm64)
+	Arch string `json:"arch"`
 }
 
-// TTL returns the cache TTL as a duration.
-func (cc *CacheConfig) TTL() time.Duration {
-	return time.Duration(cc.TTLDays) * 24 * time.Hour
+// Plugin represents a RoadRunner plugin
+type Plugin struct {
+	// ModuleName is the full Go module path
+	ModuleName string `json:"module_name"`
+
+	// Tag is the Git tag or version
+	Tag string `json:"tag"`
 }
 
-// MaxSizeBytes returns the maximum cache size in bytes.
-func (cc *CacheConfig) MaxSizeBytes() int64 {
-	return cc.MaxSizeMB * 1024 * 1024
+// VeloxResponse represents the response from Velox server
+type VeloxResponse struct {
+	// Success indicates whether the build was successful
+	Success bool `json:"success"`
+
+	// Path is the absolute path to the built binary (on success)
+	Path string `json:"path,omitempty"`
+
+	// BuildID is a unique identifier for the build
+	BuildID string `json:"build_id,omitempty"`
+
+	// DurationMs is the build duration in milliseconds
+	DurationMs int64 `json:"duration_ms,omitempty"`
+
+	// Error is the error message (on failure)
+	Error string `json:"error,omitempty"`
+
+	// Code is the error code (on failure)
+	Code string `json:"code,omitempty"`
 }
