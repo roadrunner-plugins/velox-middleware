@@ -11,11 +11,11 @@ import (
 
 // BuildRequest represents the build request from PHP worker.
 type BuildRequest struct {
-	RequestID      string   `json:"request_id"`
-	ForceRebuild   bool     `json:"force_rebuild"`
-	TargetPlatform Platform `json:"target_platform"`
-	RRVersion      string   `json:"rr_version"`
-	Plugins        []Plugin `json:"plugins"`
+	RequestID      string          `json:"request_id"`
+	ForceRebuild   bool            `json:"force_rebuild"`
+	TargetPlatform Platform        `json:"target_platform"`
+	RRVersion      string          `json:"rr_version"`
+	Plugins        []PluginRequest `json:"plugins"`
 }
 
 // Platform represents the target platform for the build.
@@ -24,8 +24,8 @@ type Platform struct {
 	Arch string `json:"arch"` // amd64, arm64
 }
 
-// Plugin represents a RoadRunner plugin to include in the build.
-type Plugin struct {
+// PluginRequest represents a RoadRunner plugin to include in the build.
+type PluginRequest struct {
 	ModuleName string `json:"module_name"`
 	Tag        string `json:"tag"`
 }
@@ -85,21 +85,21 @@ func (p *Platform) Validate() error {
 	return nil
 }
 
-// Validate validates the plugin configuration.
-func (p *Plugin) Validate() error {
-	if p.ModuleName == "" {
+// Validate validates the plugin request configuration.
+func (pr *PluginRequest) Validate() error {
+	if pr.ModuleName == "" {
 		return fmt.Errorf("module_name is required")
 	}
 
-	if p.Tag == "" {
+	if pr.Tag == "" {
 		return fmt.Errorf("tag is required")
 	}
 
 	// Basic semver validation (v prefix optional)
-	tag := strings.TrimPrefix(p.Tag, "v")
+	tag := strings.TrimPrefix(pr.Tag, "v")
 	parts := strings.Split(tag, ".")
 	if len(parts) != 3 {
-		return fmt.Errorf("invalid tag format: %s (expected semver like v1.2.3)", p.Tag)
+		return fmt.Errorf("invalid tag format: %s (expected semver like v1.2.3)", pr.Tag)
 	}
 
 	return nil

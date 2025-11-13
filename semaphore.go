@@ -7,9 +7,9 @@ import (
 
 // semaphore implements a counting semaphore for limiting concurrent operations.
 type semaphore struct {
-	slots   chan struct{}
-	active  int32
-	maxSize int
+	slots       chan struct{}
+	activeCount int32
+	maxSize     int
 }
 
 // newSemaphore creates a new semaphore with the specified maximum concurrent operations.
@@ -25,7 +25,7 @@ func (s *semaphore) acquire() <-chan struct{} {
 	ch := make(chan struct{})
 	go func() {
 		s.slots <- struct{}{}
-		atomic.AddInt32(&s.active, 1)
+		atomic.AddInt32(&s.activeCount, 1)
 		close(ch)
 	}()
 	return ch
@@ -36,7 +36,7 @@ func (s *semaphore) acquire() <-chan struct{} {
 func (s *semaphore) tryAcquire() bool {
 	select {
 	case s.slots <- struct{}{}:
-		atomic.AddInt32(&s.active, 1)
+		atomic.AddInt32(&s.activeCount, 1)
 		return true
 	default:
 		return false
@@ -46,12 +46,12 @@ func (s *semaphore) tryAcquire() bool {
 // release releases a semaphore slot.
 func (s *semaphore) release() {
 	<-s.slots
-	atomic.AddInt32(&s.active, -1)
+	atomic.AddInt32(&s.activeCount, -1)
 }
 
 // active returns the number of currently active operations.
 func (s *semaphore) active() int {
-	return int(atomic.LoadInt32(&s.active))
+	return int(atomic.LoadInt32(&s.activeCount))
 }
 
 // bufferPool provides a pool of reusable buffers for streaming operations.
