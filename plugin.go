@@ -55,6 +55,7 @@ type Plugin struct {
 	cfg         *Config
 	httpClient  *http.Client
 	writersPool sync.Pool
+	cache       *CacheManager
 }
 
 // Init initializes the plugin with configuration and dependencies
@@ -103,12 +104,28 @@ func (p *Plugin) Init(cfg Configurer, log Logger) error {
 		},
 	}
 
+	// Initialize cache manager
+	cache, err := NewCacheManager(&p.cfg.Cache, p.log)
+	if err != nil {
+		return rrerrors.E(op, fmt.Errorf("failed to initialize cache: %w", err))
+	}
+	p.cache = cache
+
 	p.log.Debug("velox middleware initialized",
 		zap.String("server_url", p.cfg.ServerURL),
 		zap.Duration("build_timeout", p.cfg.BuildTimeout),
 		zap.Duration("request_timeout", p.cfg.RequestTimeout),
+		zap.Bool("cache_enabled", p.cfg.Cache.Enabled),
 	)
 
+	return nil
+}
+
+// Stop gracefully stops the plugin
+func (p *Plugin) Stop(context.Context) error {
+	if p.cache != nil {
+		return p.cache.Stop()
+	}
 	return nil
 }
 
@@ -190,6 +207,30 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 		zap.Int("plugins_count", len(buildReq.Plugins)),
 	)
 
+	// Check cache first
+	if p.cache != nil {
+		cacheEntry, err := p.cache.Get(&buildReq)
+		if err != nil {
+			p.log.Warn("cache lookup failed, proceeding with build",
+				zap.Error(err),
+				zap.String("request_id", buildReq.RequestID),
+			)
+		} else if cacheEntry != nil {
+			// Cache hit - stream cached binary
+			p.log.Info("serving cached binary",
+				zap.String("request_id", buildReq.RequestID),
+				zap.String("hash", cacheEntry.Hash),
+				zap.Int64("file_size", cacheEntry.FileSize),
+			)
+
+			p.streamCachedBinary(ctx, w, r, rrWriter, cacheEntry)
+			return
+		}
+	}
+
+	// Cache miss or cache disabled - build with Velox
+	buildStartTime := time.Now()
+
 	// Build context with timeout
 	buildCtx, cancel := context.WithTimeout(ctx, p.cfg.BuildTimeout)
 	defer cancel()
@@ -210,6 +251,8 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 		return
 	}
 
+	buildDuration := time.Since(buildStartTime)
+
 	// Validate file path
 	if veloxResp.Path == "" {
 		p.log.Error("velox response missing file path",
@@ -222,7 +265,20 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 	p.log.Debug("velox build completed",
 		zap.String("request_id", buildReq.RequestID),
 		zap.String("file_path", veloxResp.Path),
+		zap.Duration("build_duration", buildDuration),
 	)
+
+	// Store in cache (async to not block response)
+	if p.cache != nil {
+		go func() {
+			if err := p.cache.Store(&buildReq, veloxResp.Path, buildDuration); err != nil {
+				p.log.Error("failed to store binary in cache",
+					zap.Error(err),
+					zap.String("request_id", buildReq.RequestID),
+				)
+			}
+		}()
+	}
 
 	// Check if client is still connected before streaming
 	select {
@@ -262,6 +318,38 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 	p.log.Debug("file streamed successfully",
 		zap.String("request_id", buildReq.RequestID),
 		zap.String("file_path", veloxResp.Path),
+	)
+}
+
+// streamCachedBinary streams a cached binary to the client
+func (p *Plugin) streamCachedBinary(ctx context.Context, w http.ResponseWriter, r *http.Request, rrWriter *writer, entry *CacheEntry) {
+	// Copy headers from PHP worker response
+	for k := range rrWriter.hdrToSend {
+		// Skip headers that we don't want to forward
+		if k == xVeloxBuildHeader || k == "Content-Encoding" || k == "Content-Type" || k == "Content-Length" {
+			continue
+		}
+		for _, v := range rrWriter.hdrToSend[k] {
+			w.Header().Add(k, v)
+		}
+	}
+
+	// Get binary path
+	binaryPath := p.cache.GetBinaryPath(entry.Hash)
+
+	// Stream cached file
+	if err := p.streamFile(ctx, w, binaryPath); err != nil {
+		p.log.Error("failed to stream cached file",
+			zap.Error(err),
+			zap.String("hash", entry.Hash),
+			zap.String("file_path", binaryPath),
+		)
+		return
+	}
+
+	p.log.Debug("cached file streamed successfully",
+		zap.String("hash", entry.Hash),
+		zap.Int64("file_size", entry.FileSize),
 	)
 }
 
