@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -111,6 +112,15 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, body [
 			zap.String("cache_key", cacheKey),
 		)
 
+		// Check if error is due to client disconnect
+		if isClientDisconnect(err) {
+			p.log.Warn("client disconnected during build",
+				zap.String("request_id", buildReq.RequestID),
+			)
+			metricsIncClientDisconnects("streaming")
+			return
+		}
+
 		// Determine error type and status code
 		statusCode := http.StatusBadGateway
 		errorType := "build_failed"
@@ -123,6 +133,8 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, body [
 			metricsIncBuildsByStatus("error", "miss")
 		}
 
+		// Only write error response if we haven't started sending data yet
+		// (if streaming started, headers are already sent)
 		p.writeErrorResponse(w, statusCode, errorType, err.Error(), buildReq.RequestID)
 		return
 	}
@@ -285,6 +297,18 @@ func (p *Plugin) handleVeloxPathResponse(ctx context.Context, w http.ResponseWri
 		fileSize = stat.Size()
 	}
 
+	// Check if client is still connected before starting stream
+	select {
+	case <-ctx.Done():
+		p.log.Warn("client disconnected before streaming started",
+			zap.String("request_id", req.RequestID),
+		)
+		metricsIncClientDisconnects("pre_stream")
+		return ctx.Err()
+	default:
+		// Continue
+	}
+
 	// Prepare cache file (if caching enabled)
 	var cacheWriter io.WriteCloser
 	var cachePath string
@@ -312,6 +336,7 @@ func (p *Plugin) handleVeloxPathResponse(ctx context.Context, w http.ResponseWri
 	w.Header().Set("X-Cache-Status", "MISS")
 	w.Header().Set("X-Build-Time", fmt.Sprintf("%.1f", time.Since(buildStart).Seconds()))
 
+	// Write headers - after this point, we can't send error responses
 	w.WriteHeader(http.StatusOK)
 
 	// Stream file to client and cache simultaneously
@@ -331,7 +356,18 @@ func (p *Plugin) handleVeloxPathResponse(ctx context.Context, w http.ResponseWri
 			// Delete incomplete cache file
 			p.cache.CleanupFailedWrite(cachePath)
 		}
-		metricsIncErrors("stream")
+
+		// Check if client disconnect
+		if isClientDisconnect(err) {
+			p.log.Warn("client disconnected during streaming",
+				zap.String("request_id", req.RequestID),
+				zap.Int64("bytes_streamed", bytesWritten),
+			)
+			metricsIncClientDisconnects("streaming")
+		} else {
+			metricsIncErrors("stream")
+		}
+
 		return fmt.Errorf("failed to stream binary: %w", err)
 	}
 
@@ -497,6 +533,7 @@ func (p *Plugin) handleVeloxBinaryResponse(ctx context.Context, w http.ResponseW
 }
 
 // writeErrorResponse writes an error response to the client.
+// Note: This should only be called before any response data has been sent.
 func (p *Plugin) writeErrorResponse(w http.ResponseWriter, statusCode int, errorType, message, requestID string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
@@ -511,4 +548,18 @@ func (p *Plugin) writeErrorResponse(w http.ResponseWriter, statusCode int, error
 	}
 
 	json.NewEncoder(w).Encode(errorResp)
+}
+
+// isClientDisconnect checks if an error is due to client disconnection.
+func isClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := err.Error()
+	// Common client disconnect patterns
+	return strings.Contains(errMsg, "connection reset by peer") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "client disconnected") ||
+		strings.Contains(errMsg, "write: connection timed out")
 }
