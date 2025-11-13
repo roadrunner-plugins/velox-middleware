@@ -1,5 +1,7 @@
 package veloxmiddleware
 
+import "go.uber.org/zap"
+
 // Configurer is the interface for accessing RoadRunner configuration.
 type Configurer interface {
 	// Has checks if configuration section exists

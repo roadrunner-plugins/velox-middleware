@@ -2,10 +2,10 @@ package veloxmiddleware
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"time"
 
-	"github.com/roadrunner-server/api/v4/plugins/v4/middleware"
 	"github.com/roadrunner-server/errors"
 	"go.uber.org/zap"
 )
@@ -156,19 +156,20 @@ func (p *Plugin) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Middleware returns the middleware function that will be registered with RoadRunner's HTTP plugin.
-// This function intercepts responses and handles Velox build requests.
-func (p *Plugin) Middleware(next middleware.Handler) middleware.Handler {
-	return func(req middleware.Request, resp middleware.Response) error {
+// Middleware returns the HTTP middleware function that will be registered with RoadRunner's HTTP plugin.
+// This function intercepts requests and handles Velox build requests when the special header is present.
+func (p *Plugin) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check if this is a Velox build request
-		if req.Header.Get(HeaderVeloxBuild) != "true" {
-			// Not a Velox request, pass through
-			return next(req, resp)
+		if r.Header.Get(HeaderVeloxBuild) != "true" {
+			// Not a Velox request, pass through to next handler
+			next.ServeHTTP(w, r)
+			return
 		}
 
 		// Handle Velox build request
-		return p.handleVeloxBuild(req, resp)
-	}
+		p.handleVeloxBuild(w, r)
+	})
 }
 
 // Name returns the plugin name for registration in the Endure container.

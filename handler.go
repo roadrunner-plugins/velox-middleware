@@ -8,22 +8,33 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/roadrunner-server/api/v4/plugins/v4/middleware"
 	"go.uber.org/zap"
 )
 
-// handleVeloxBuild processes a Velox build request intercepted from PHP worker response.
-func (p *Plugin) handleVeloxBuild(req middleware.Request, resp middleware.Response) error {
+// handleVeloxBuild processes a Velox build request intercepted from the HTTP request.
+func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 
-	// Parse build request from response body
-	buildReq, err := p.parseBuildRequest(resp.Body())
+	// Read and parse build request from request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		p.log.Error("failed to read request body",
+			zap.Error(err),
+			zap.String("remote_addr", r.RemoteAddr),
+		)
+		p.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to read request body", "")
+		return
+	}
+	defer r.Body.Close()
+
+	buildReq, err := p.parseBuildRequest(body)
 	if err != nil {
 		p.log.Error("failed to parse build request",
 			zap.Error(err),
-			zap.String("remote_addr", req.RemoteAddr()),
+			zap.String("remote_addr", r.RemoteAddr),
 		)
-		return p.writeErrorResponse(resp, http.StatusBadRequest, "invalid_request", err.Error(), "")
+		p.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", err.Error(), "")
+		return
 	}
 
 	p.log.Info("build request received",
@@ -49,19 +60,19 @@ func (p *Plugin) handleVeloxBuild(req middleware.Request, resp middleware.Respon
 			)
 
 			// Stream cached binary
-			if err := p.streamCachedBinary(resp, buildReq, entry); err != nil {
+			if err := p.streamCachedBinary(w, buildReq, entry); err != nil {
 				p.log.Error("failed to stream cached binary",
 					zap.Error(err),
 					zap.String("request_id", buildReq.RequestID),
 					zap.String("cache_key", cacheKey),
 				)
-				return p.writeErrorResponse(resp, http.StatusInternalServerError, "cache_read_error", "Failed to read cached binary", buildReq.RequestID)
+				p.writeErrorResponse(w, http.StatusInternalServerError, "cache_read_error", "Failed to read cached binary", buildReq.RequestID)
 			}
 
 			metricsIncCacheHits()
 			metricsObserveStreamTTFB(time.Since(startTime), "hit")
 
-			return nil
+			return
 		}
 
 		p.log.Info("cache miss, building from Velox server",
@@ -83,12 +94,12 @@ func (p *Plugin) handleVeloxBuild(req middleware.Request, resp middleware.Respon
 		select {
 		case <-p.sem.acquire():
 			defer p.sem.release()
-		case <-req.Context().Done():
+		case <-r.Context().Done():
 			p.log.Warn("client disconnected while waiting for build slot",
 				zap.String("request_id", buildReq.RequestID),
 			)
 			metricsIncClientDisconnects("queue")
-			return req.Context().Err()
+			return
 		}
 	} else {
 		defer p.sem.release()
@@ -97,11 +108,11 @@ func (p *Plugin) handleVeloxBuild(req middleware.Request, resp middleware.Respon
 	metricsSetActiveBuilds(p.sem.active())
 
 	// Build with timeout
-	buildCtx, buildCancel := context.WithTimeout(req.Context(), p.cfg.BuildTimeout)
+	buildCtx, buildCancel := context.WithTimeout(r.Context(), p.cfg.BuildTimeout)
 	defer buildCancel()
 
 	// Execute build and stream result
-	if err := p.buildAndStream(buildCtx, resp, buildReq, cacheKey, startTime); err != nil {
+	if err := p.buildAndStream(buildCtx, w, buildReq, cacheKey, startTime); err != nil {
 		p.log.Error("build failed",
 			zap.Error(err),
 			zap.String("request_id", buildReq.RequestID),
@@ -120,17 +131,16 @@ func (p *Plugin) handleVeloxBuild(req middleware.Request, resp middleware.Respon
 			metricsIncBuildsByStatus("error", "miss")
 		}
 
-		return p.writeErrorResponse(resp, statusCode, errorType, err.Error(), buildReq.RequestID)
+		p.writeErrorResponse(w, statusCode, errorType, err.Error(), buildReq.RequestID)
+		return
 	}
 
 	metricsSetActiveBuilds(p.sem.active())
 	metricsIncBuildsByStatus("success", "miss")
 	metricsObserveStreamTTFB(time.Since(startTime), "miss")
-
-	return nil
 }
 
-// parseBuildRequest parses the build request from the response body.
+// parseBuildRequest parses the build request from the request body.
 func (p *Plugin) parseBuildRequest(body []byte) (*BuildRequest, error) {
 	var req BuildRequest
 
@@ -146,7 +156,7 @@ func (p *Plugin) parseBuildRequest(body []byte) (*BuildRequest, error) {
 }
 
 // streamCachedBinary streams a cached binary to the client.
-func (p *Plugin) streamCachedBinary(resp middleware.Response, req *BuildRequest, entry *CacheEntry) error {
+func (p *Plugin) streamCachedBinary(w http.ResponseWriter, req *BuildRequest, entry *CacheEntry) error {
 	// Open cached file
 	file, err := p.cache.OpenBinary(entry.FilePath)
 	if err != nil {
@@ -155,20 +165,20 @@ func (p *Plugin) streamCachedBinary(resp middleware.Response, req *BuildRequest,
 	defer file.Close()
 
 	// Set response headers
-	resp.Header().Set("Content-Type", "application/octet-stream")
-	resp.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", req.BinaryFilename()))
-	resp.Header().Set("Content-Length", fmt.Sprintf("%d", entry.FileSize))
-	resp.Header().Set("X-Build-Request-ID", req.RequestID)
-	resp.Header().Set("X-Cache-Status", "HIT")
-	resp.Header().Set("X-Cache-Age", fmt.Sprintf("%d", int(time.Since(entry.CreatedAt).Seconds())))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", req.BinaryFilename()))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", entry.FileSize))
+	w.Header().Set("X-Build-Request-ID", req.RequestID)
+	w.Header().Set("X-Cache-Status", "HIT")
+	w.Header().Set("X-Cache-Age", fmt.Sprintf("%d", int(time.Since(entry.CreatedAt).Seconds())))
 
-	resp.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusOK)
 
 	// Stream file to client using buffered pool
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
 
-	if _, err := io.CopyBuffer(resp.Body(), file, buf); err != nil {
+	if _, err := io.CopyBuffer(w, file, buf); err != nil {
 		return fmt.Errorf("failed to stream cached binary: %w", err)
 	}
 
@@ -179,7 +189,7 @@ func (p *Plugin) streamCachedBinary(resp middleware.Response, req *BuildRequest,
 }
 
 // buildAndStream executes a Velox build and streams the result to the client.
-func (p *Plugin) buildAndStream(ctx context.Context, resp middleware.Response, req *BuildRequest, cacheKey string, startTime time.Time) error {
+func (p *Plugin) buildAndStream(ctx context.Context, w http.ResponseWriter, req *BuildRequest, cacheKey string, startTime time.Time) error {
 	buildStart := time.Now()
 
 	// Call Velox server
@@ -217,24 +227,24 @@ func (p *Plugin) buildAndStream(ctx context.Context, resp middleware.Response, r
 	}
 
 	// Set response headers
-	resp.Header().Set("Content-Type", "application/octet-stream")
-	resp.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", req.BinaryFilename()))
-	resp.Header().Set("X-Build-Request-ID", req.RequestID)
-	resp.Header().Set("X-Cache-Status", "MISS")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", req.BinaryFilename()))
+	w.Header().Set("X-Build-Request-ID", req.RequestID)
+	w.Header().Set("X-Cache-Status", "MISS")
 
 	// Get content length if available
 	if veloxResp.ContentLength > 0 {
-		resp.Header().Set("Content-Length", fmt.Sprintf("%d", veloxResp.ContentLength))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", veloxResp.ContentLength))
 	}
 
-	resp.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusOK)
 
 	// Stream binary to client and cache simultaneously
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
 
 	var writers []io.Writer
-	writers = append(writers, resp.Body())
+	writers = append(writers, w)
 	if cacheWriter != nil {
 		writers = append(writers, cacheWriter)
 	}
@@ -251,7 +261,7 @@ func (p *Plugin) buildAndStream(ctx context.Context, resp middleware.Response, r
 	}
 
 	buildDuration := time.Since(buildStart)
-	resp.Header().Set("X-Build-Time", fmt.Sprintf("%.1f", buildDuration.Seconds()))
+	w.Header().Set("X-Build-Time", fmt.Sprintf("%.1f", buildDuration.Seconds()))
 
 	p.log.Info("build completed",
 		zap.String("request_id", req.RequestID),
@@ -303,9 +313,9 @@ func (p *Plugin) buildAndStream(ctx context.Context, resp middleware.Response, r
 }
 
 // writeErrorResponse writes an error response to the client.
-func (p *Plugin) writeErrorResponse(resp middleware.Response, statusCode int, errorType, message, requestID string) error {
-	resp.Header().Set("Content-Type", "application/json")
-	resp.WriteHeader(statusCode)
+func (p *Plugin) writeErrorResponse(w http.ResponseWriter, statusCode int, errorType, message, requestID string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
 
 	errorResp := map[string]string{
 		"error":   errorType,
@@ -316,5 +326,5 @@ func (p *Plugin) writeErrorResponse(resp middleware.Response, statusCode int, er
 		errorResp["request_id"] = requestID
 	}
 
-	return json.NewEncoder(resp.Body()).Encode(errorResp)
+	json.NewEncoder(w).Encode(errorResp)
 }
