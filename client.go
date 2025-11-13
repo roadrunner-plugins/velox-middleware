@@ -96,12 +96,14 @@ func (c *VeloxClient) Build(ctx context.Context, req *BuildRequest) (*http.Respo
 func (c *VeloxClient) doBuild(ctx context.Context, req *BuildRequest) (*http.Response, error) {
 	// Prepare request body (Connect RPC expects JSON)
 	reqBody := map[string]interface{}{
+		"request_id": req.RequestID, // Required by Velox server
 		"target_platform": map[string]string{
 			"os":   req.TargetPlatform.OS,
 			"arch": req.TargetPlatform.Arch,
 		},
-		"rr_version": req.RRVersion,
-		"plugins":    req.Plugins,
+		"rr_version":    req.RRVersion,
+		"plugins":       req.Plugins,
+		"force_rebuild": req.ForceRebuild,
 	}
 
 	bodyBytes := &bytes.Buffer{}
@@ -121,7 +123,6 @@ func (c *VeloxClient) doBuild(ctx context.Context, req *BuildRequest) (*http.Res
 	// Set headers for Connect RPC
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/octet-stream")
-	httpReq.Header.Set("X-Request-ID", req.RequestID)
 
 	c.log.Debug("sending build request to Velox",
 		zap.String("request_id", req.RequestID),
