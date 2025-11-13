@@ -1,6 +1,6 @@
-# Velox Middleware Plugin
+# Velox Plugin
 
-A high-performance RoadRunner middleware plugin that intercepts Velox binary build requests from PHP workers, manages
+A high-performance RoadRunner HTTP middleware plugin that intercepts Velox binary build requests from PHP workers, manages
 intelligent caching with LRU eviction, and streams binaries directly to clients without blocking expensive PHP worker
 processes.
 
@@ -19,6 +19,7 @@ worker, and handles the entire build-cache-stream lifecycle in Go.
 - **Comprehensive Metrics**: 20+ Prometheus metrics for monitoring cache effectiveness, build performance, and errors
 - **Graceful Shutdown**: Waits for active builds to complete before shutdown
 - **Production Ready**: Extensive error handling, structured logging, and observability
+- **Automatic Registration**: Middleware automatically discovered and registered by HTTP plugin
 
 ## Architecture
 
@@ -28,17 +29,18 @@ worker, and handles the entire build-cache-stream lifecycle in Go.
 └──────┬──────┘
        │
        ▼
-┌─────────────────────────────────────────────────────────┐
-│                  Velox Middleware Plugin                │
-│                                                          │
-│  1. Parse build request from response body              │
-│  2. Generate cache key (SHA256 of normalized config)    │
-│  3. Check cache (if not force_rebuild)                  │
-│     ├─ HIT  → Stream cached binary to client            │
-│     └─ MISS → Acquire semaphore slot                    │
-│                └─ Call Velox server                     │
-│                   └─ Stream to client + cache           │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                     Velox Plugin                         │
+│  (HTTP Middleware - automatically registered)            │
+│                                                           │
+│  1. Parse build request from response body               │
+│  2. Generate cache key (SHA256 of normalized config)     │
+│  3. Check cache (if not force_rebuild)                   │
+│     ├─ HIT  → Stream cached binary to client             │
+│     └─ MISS → Acquire semaphore slot                     │
+│                └─ Call Velox server                      │
+│                   └─ Stream to client + cache            │
+└──────────────────────────────────────────────────────────┘
        │
        ▼
 ┌─────────────┐
@@ -48,17 +50,59 @@ worker, and handles the entire build-cache-stream lifecycle in Go.
 
 ## Configuration
 
+### Plugin Registration
+
+This plugin can be registered with RoadRunner's HTTP plugin in two ways:
+
+#### 1. Manual Registration (Recommended)
+
+Explicitly list the plugin in HTTP middleware configuration:
+
+```yaml
+http:
+  address: 0.0.0.0:8080
+  middleware: ["velox"]  # Explicit middleware registration
+
+velox:
+  server_url: "http://127.0.0.1:9000"
+```
+
+This gives you full control over middleware order and ensures the plugin is only active when explicitly enabled.
+
+#### 2. Automatic Discovery
+
+If no middleware list is specified, the HTTP plugin discovers all plugins implementing the middleware interface:
+
+```yaml
+http:
+  address: 0.0.0.0:8080
+  # No middleware: [] - automatic discovery
+
+velox:
+  server_url: "http://127.0.0.1:9000"
+```
+
+**Note:** For production environments, manual registration is recommended for predictable behavior.
+
 ### Minimal Configuration
 
 ```yaml
-velox-middleware:
+http:
+  address: 0.0.0.0:8080
+  middleware: ["velox"]
+
+velox:
   server_url: "http://127.0.0.1:9000"
 ```
 
 ### Full Configuration
 
 ```yaml
-velox-middleware:
+http:
+  address: 0.0.0.0:8080
+  middleware: ["gzip", "velox", "sendfile"]  # Middleware execution order
+
+velox:
   # Velox server endpoint (required)
   server_url: "http://velox.internal.company.com:9000"
 
@@ -99,12 +143,68 @@ velox-middleware:
 ### Cache Disabled
 
 ```yaml
-velox-middleware:
+velox:
   server_url: "http://127.0.0.1:9000"
 
   cache:
     enabled: false
 ```
+
+### Integration with Other Plugins
+
+Middleware execution order is controlled by the `middleware` list:
+
+```yaml
+# .rr.yaml
+version: "3"
+
+# HTTP plugin with explicit middleware registration
+http:
+  address: 0.0.0.0:8080
+  
+  # Middleware execution order (left to right)
+  # Request flow: gzip → velox → sendfile → PHP workers
+  middleware: ["gzip", "velox", "sendfile"]
+
+# Velox plugin configuration  
+velox:
+  server_url: "http://velox-server:9000"
+  max_concurrent_builds: 10
+  cache:
+    enabled: true
+    max_size_mb: 10000
+
+# Metrics plugin for Prometheus integration
+metrics:
+  address: 0.0.0.0:2112
+
+# Other plugins work normally
+rpc:
+  listen: tcp://127.0.0.1:6001
+
+# Logs plugin
+logs:
+  mode: production
+  level: info
+```
+
+### Middleware Order Matters
+
+```yaml
+# Example 1: Velox before sendfile
+http:
+  middleware: ["velox", "sendfile"]
+# If X-Velox-Build header present → Velox handles it
+# Otherwise → request passes to sendfile → PHP workers
+
+# Example 2: Sendfile before velox (not recommended)
+http:
+  middleware: ["sendfile", "velox"]
+# Sendfile checks response first, then velox
+# This may cause issues if both headers are present
+```
+
+**Best Practice:** Place `velox` middleware early in the chain since it intercepts requests before they reach PHP workers.
 
 ## PHP Integration
 

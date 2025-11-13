@@ -125,6 +125,8 @@ var (
 // initMetrics registers all Prometheus metrics.
 func initMetrics() {
 	metricsOnce.Do(func() {
+		// Register all metrics explicitly
+		// This is required even when MetricsCollector() is implemented
 		prometheus.MustRegister(
 			// Cache metrics
 			cacheHits,
@@ -216,15 +218,12 @@ func metricsIncClientDisconnects(stage string) {
 	clientDisconnects.WithLabelValues(stage).Inc()
 }
 
-// StatProvider interface implementation for RoadRunner metrics plugin integration
-type StatProvider interface {
-	MetricsCollector() []prometheus.Collector
-}
-
 // MetricsCollector returns all Prometheus collectors for this plugin.
+// This method is called by RoadRunner's metrics plugin to collect metrics.
+//
+// IMPORTANT: Metrics must also be registered via prometheus.MustRegister() in initMetrics().
+// The MetricsCollector() method alone is not sufficient - explicit registration is required.
 func (p *Plugin) MetricsCollector() []prometheus.Collector {
-	initMetrics()
-
 	return []prometheus.Collector{
 		// Cache metrics
 		cacheHits,

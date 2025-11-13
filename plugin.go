@@ -12,7 +12,7 @@ import (
 
 const (
 	// PluginName is the unique identifier for the Velox middleware plugin
-	PluginName = "velox-middleware"
+	PluginName = "velox"
 
 	// HeaderVeloxBuild is the HTTP header that triggers Velox build interception
 	HeaderVeloxBuild = "X-Velox-Build"
@@ -37,7 +37,7 @@ type Plugin struct {
 // Init initializes the plugin with configuration and dependencies.
 // This method is called by the Endure container during plugin initialization.
 func (p *Plugin) Init(cfg Configurer, log Logger) error {
-	const op = errors.Op("velox_middleware_plugin_init")
+	const op = errors.Op("velox_plugin_init")
 
 	if !cfg.Has(PluginName) {
 		return errors.E(op, errors.Disabled)
@@ -55,6 +55,9 @@ func (p *Plugin) Init(cfg Configurer, log Logger) error {
 
 	p.log = log.NamedLogger(PluginName)
 	p.stopCh = make(chan struct{})
+
+	// Initialize metrics early
+	initMetrics()
 
 	// Initialize semaphore for build concurrency control
 	p.sem = newSemaphore(p.cfg.MaxConcurrentBuilds)
@@ -156,8 +159,25 @@ func (p *Plugin) Stop(ctx context.Context) error {
 	return nil
 }
 
+// Name returns the plugin name for registration in the Endure container.
+func (p *Plugin) Name() string {
+	return PluginName
+}
+
+// Weight returns the plugin weight for dependency resolution.
+// Higher weight means the plugin will be initialized/served later.
+// Velox needs to be initialized before HTTP plugin (weight 10).
+func (p *Plugin) Weight() uint {
+	return 9
+}
+
 // Middleware returns the HTTP middleware function that will be registered with RoadRunner's HTTP plugin.
 // This function intercepts requests and handles Velox build requests when the special header is present.
+//
+// The HTTP plugin will automatically discover and register this middleware if the plugin:
+// 1. Implements the Middleware(next http.Handler) http.Handler method
+// 2. Implements the Name() string method
+// 3. Is properly initialized in the Endure container
 func (p *Plugin) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check if this is a Velox build request
@@ -170,20 +190,4 @@ func (p *Plugin) Middleware(next http.Handler) http.Handler {
 		// Handle Velox build request
 		p.handleVeloxBuild(w, r)
 	})
-}
-
-// Name returns the plugin name for registration in the Endure container.
-func (p *Plugin) Name() string {
-	return PluginName
-}
-
-// Weight returns the plugin weight for dependency resolution.
-// Higher weight means the plugin will be initialized/served later.
-func (p *Plugin) Weight() uint {
-	return 10
-}
-
-// RPC returns nil as this plugin doesn't expose RPC methods.
-func (p *Plugin) RPC() interface{} {
-	return nil
 }
