@@ -21,6 +21,9 @@ type Config struct {
 
 	// Retry configuration for Velox server communication
 	Retry RetryConfig `mapstructure:"retry"`
+
+	// Cache configuration for binary caching
+	Cache CacheConfig `mapstructure:"cache"`
 }
 
 // RetryConfig holds retry configuration
@@ -63,6 +66,9 @@ func (c *Config) InitDefaults() {
 	if c.Retry.BackoffMultiplier == 0 {
 		c.Retry.BackoffMultiplier = 2.0
 	}
+
+	// Initialize cache defaults
+	c.Cache.InitDefaults()
 }
 
 // Validate validates the configuration
