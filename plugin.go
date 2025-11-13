@@ -227,8 +227,32 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 		zap.String("file_path", veloxResp.Path),
 	)
 
+	// Check if client is still connected before streaming
+	select {
+	case <-ctx.Done():
+		p.log.Warn("client disconnected before streaming",
+			zap.String("request_id", buildReq.RequestID),
+			zap.Error(ctx.Err()),
+		)
+		return
+	default:
+		// Client still connected, proceed with streaming
+	}
+
+	// Copy headers from PHP worker response before streaming
+	// (except X-Velox-Build and Content-Encoding which are already handled)
+	for k := range rrWriter.hdrToSend {
+		// Skip headers that we don't want to forward
+		if k == xVeloxBuildHeader || k == "Content-Encoding" || k == "Content-Type" || k == "Content-Length" {
+			continue
+		}
+		for _, v := range rrWriter.hdrToSend[k] {
+			w.Header().Add(k, v)
+		}
+	}
+
 	// Stream file to client
-	if err := p.streamFile(w, veloxResp.Path); err != nil {
+	if err := p.streamFile(ctx, w, veloxResp.Path); err != nil {
 		p.log.Error("failed to stream file",
 			zap.Error(err),
 			zap.String("request_id", buildReq.RequestID),
@@ -326,7 +350,7 @@ func (p *Plugin) requestBuild(ctx context.Context, buildReq *BuildRequest) (*Vel
 }
 
 // streamFile streams a file to the HTTP response writer
-func (p *Plugin) streamFile(w http.ResponseWriter, filePath string) error {
+func (p *Plugin) streamFile(ctx context.Context, w http.ResponseWriter, filePath string) error {
 	const op = rrerrors.Op("velox_stream_file")
 
 	// Security check: prevent path traversal
@@ -349,9 +373,11 @@ func (p *Plugin) streamFile(w http.ResponseWriter, filePath string) error {
 		_ = f.Close()
 	}()
 
-	// Set response headers
+	// Set response headers BEFORE WriteHeader
 	w.Header().Set("Content-Type", ContentTypeOctetStream)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", fs.Size()))
+
+	// Write status code - this MUST come after setting headers
 	w.WriteHeader(http.StatusOK)
 
 	size := fs.Size()
@@ -368,6 +394,14 @@ func (p *Plugin) streamFile(w http.ResponseWriter, filePath string) error {
 
 	off := 0
 	for {
+		// Check if client disconnected
+		select {
+		case <-ctx.Done():
+			return rrerrors.E(op, fmt.Errorf("client disconnected: %w", ctx.Err()))
+		default:
+			// Continue streaming
+		}
+
 		n, err := f.ReadAt(buf, int64(off))
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -387,8 +421,8 @@ func (p *Plugin) streamFile(w http.ResponseWriter, filePath string) error {
 		}
 
 		// Flush data to client
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
 		}
 
 		off += n
