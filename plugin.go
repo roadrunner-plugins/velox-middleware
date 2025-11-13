@@ -91,10 +91,10 @@ func (p *Plugin) Init(cfg Configurer, log Logger) error {
 		}
 		p.cache = cache
 	} else {
-		p.log.Info("cache disabled, all builds will go directly to Velox server")
+		p.log.Debug("cache disabled, all builds will go directly to Velox server")
 	}
 
-	p.log.Info("plugin initialized",
+	p.log.Debug("plugin initialized",
 		zap.String("server_url", p.cfg.ServerURL),
 		zap.Bool("cache_enabled", p.cfg.Cache.Enabled),
 		zap.Int("max_concurrent_builds", p.cfg.MaxConcurrentBuilds),
@@ -118,7 +118,7 @@ func (p *Plugin) Serve() chan error {
 		go p.cache.StartBackgroundTasks(p.stopCh)
 	}
 
-	p.log.Info("plugin serving")
+	p.log.Debug("plugin serving")
 
 	return errCh
 }
@@ -148,7 +148,7 @@ func (p *Plugin) Stop(ctx context.Context) error {
 
 	select {
 	case <-done:
-		p.log.Info("all active builds completed")
+		p.log.Debug("all active builds completed")
 	case <-ctx.Done():
 		p.log.Warn("shutdown timeout reached, some builds may have been interrupted",
 			zap.Int("active_builds", p.sem.active()),
@@ -169,7 +169,7 @@ func (p *Plugin) Stop(ctx context.Context) error {
 		return err
 	}
 
-	p.log.Info("plugin stopped")
+	p.log.Debug("plugin stopped")
 	return nil
 }
 
@@ -213,7 +213,7 @@ func (p *Plugin) Middleware(next http.Handler) http.Handler {
 		}
 
 		// Velox build request detected - intercept and handle
-		p.log.Info("velox build request detected from PHP worker",
+		p.log.Debug("velox build request detected from PHP worker",
 			zap.String("path", r.URL.Path),
 			zap.String("method", r.Method),
 		)

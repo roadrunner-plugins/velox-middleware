@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"go.uber.org/zap"
@@ -28,7 +29,7 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, body [
 		return
 	}
 
-	p.log.Info("build request received",
+	p.log.Debug("build request received",
 		zap.String("request_id", buildReq.RequestID),
 		zap.String("os", buildReq.TargetPlatform.OS),
 		zap.String("arch", buildReq.TargetPlatform.Arch),
@@ -43,7 +44,7 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, body [
 	// Check cache (unless force rebuild)
 	if !buildReq.ForceRebuild && p.cache != nil {
 		if entry, found := p.cache.Get(cacheKey); found {
-			p.log.Info("cache hit",
+			p.log.Debug("cache hit",
 				zap.String("request_id", buildReq.RequestID),
 				zap.String("cache_key", cacheKey),
 				zap.Duration("cache_age", time.Since(entry.CreatedAt)),
@@ -66,13 +67,13 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, body [
 			return
 		}
 
-		p.log.Info("cache miss, building from Velox server",
+		p.log.Debug("cache miss, building from Velox server",
 			zap.String("request_id", buildReq.RequestID),
 			zap.String("cache_key", cacheKey),
 		)
 		metricsIncCacheMisses()
 	} else if buildReq.ForceRebuild {
-		p.log.Info("force rebuild requested, skipping cache",
+		p.log.Debug("force rebuild requested, skipping cache",
 			zap.String("request_id", buildReq.RequestID),
 			zap.String("cache_key", cacheKey),
 		)
@@ -220,9 +221,178 @@ func (p *Plugin) buildAndStream(ctx context.Context, w http.ResponseWriter, req 
 		return fmt.Errorf("velox server returned status %d: %s", veloxResp.StatusCode, string(body))
 	}
 
+	// Check if response is JSON (Velox returns file path) or binary (direct stream)
+	contentType := veloxResp.Header.Get("Content-Type")
+
+	if contentType == "application/json" {
+		// Velox returned JSON with file path
+		return p.handleVeloxPathResponse(ctx, w, veloxResp, req, cacheKey, buildStart)
+	}
+
+	// Velox returned binary directly
+	return p.handleVeloxBinaryResponse(ctx, w, veloxResp, req, cacheKey, buildStart)
+}
+
+// handleVeloxPathResponse handles Velox response containing a file path.
+func (p *Plugin) handleVeloxPathResponse(ctx context.Context, w http.ResponseWriter, veloxResp *http.Response, req *BuildRequest, cacheKey string, buildStart time.Time) error {
+	// Parse JSON response to get file path
+	var pathResp struct {
+		Path      string `json:"path"`
+		Size      int64  `json:"size,omitempty"`
+		BuildTime string `json:"build_time,omitempty"`
+	}
+
+	body, err := io.ReadAll(veloxResp.Body)
+	if err != nil {
+		metricsIncErrors("velox_server")
+		return fmt.Errorf("failed to read Velox response: %w", err)
+	}
+
+	if err := json.Unmarshal(body, &pathResp); err != nil {
+		metricsIncErrors("velox_server")
+		p.log.Error("failed to parse Velox path response",
+			zap.Error(err),
+			zap.String("body", string(body[:min(len(body), 500)])),
+		)
+		return fmt.Errorf("failed to parse Velox path response: %w", err)
+	}
+
+	if pathResp.Path == "" {
+		return fmt.Errorf("Velox response missing file path")
+	}
+
+	p.log.Info("Velox build completed, streaming from file",
+		zap.String("request_id", req.RequestID),
+		zap.String("file_path", pathResp.Path),
+		zap.Int64("file_size", pathResp.Size),
+	)
+
+	// Open the file from Velox's response
+	file, err := os.Open(pathResp.Path)
+	if err != nil {
+		metricsIncErrors("file_read")
+		return fmt.Errorf("failed to open build file: %w", err)
+	}
+	defer file.Close()
+
+	// Get file info if size not provided
+	fileSize := pathResp.Size
+	if fileSize == 0 {
+		stat, err := file.Stat()
+		if err != nil {
+			return fmt.Errorf("failed to stat build file: %w", err)
+		}
+		fileSize = stat.Size()
+	}
+
 	// Prepare cache file (if caching enabled)
 	var cacheWriter io.WriteCloser
 	var cachePath string
+
+	if p.cache != nil {
+		cacheWriter, cachePath, err = p.cache.PrepareWrite(cacheKey)
+		if err != nil {
+			p.log.Warn("failed to prepare cache write, continuing without caching",
+				zap.Error(err),
+				zap.String("request_id", req.RequestID),
+			)
+		}
+		defer func() {
+			if cacheWriter != nil {
+				cacheWriter.Close()
+			}
+		}()
+	}
+
+	// Set response headers
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", req.BinaryFilename()))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
+	w.Header().Set("X-Build-Request-ID", req.RequestID)
+	w.Header().Set("X-Cache-Status", "MISS")
+	w.Header().Set("X-Build-Time", fmt.Sprintf("%.1f", time.Since(buildStart).Seconds()))
+
+	w.WriteHeader(http.StatusOK)
+
+	// Stream file to client and cache simultaneously
+	buf := bufferPool.Get().([]byte)
+	defer bufferPool.Put(buf)
+
+	var writers []io.Writer
+	writers = append(writers, w)
+	if cacheWriter != nil {
+		writers = append(writers, cacheWriter)
+	}
+
+	multiWriter := io.MultiWriter(writers...)
+	bytesWritten, err := io.CopyBuffer(multiWriter, file, buf)
+	if err != nil {
+		if cacheWriter != nil {
+			// Delete incomplete cache file
+			p.cache.CleanupFailedWrite(cachePath)
+		}
+		metricsIncErrors("stream")
+		return fmt.Errorf("failed to stream binary: %w", err)
+	}
+
+	buildDuration := time.Since(buildStart)
+
+	p.log.Info("build completed and streamed",
+		zap.String("request_id", req.RequestID),
+		zap.Duration("build_duration", buildDuration),
+		zap.Int64("bytes_written", bytesWritten),
+		zap.String("source", "file_path"),
+	)
+
+	// Finalize cache entry
+	if cacheWriter != nil && p.cache != nil {
+		if err := cacheWriter.Close(); err != nil {
+			p.log.Warn("failed to close cache writer",
+				zap.Error(err),
+				zap.String("request_id", req.RequestID),
+			)
+			p.cache.CleanupFailedWrite(cachePath)
+			metricsIncErrors("cache_write")
+		} else {
+			// Commit cache entry
+			entry := &CacheEntry{
+				Key:          cacheKey,
+				FilePath:     cachePath,
+				FileSize:     bytesWritten,
+				CreatedAt:    time.Now(),
+				ExpiresAt:    time.Now().Add(p.cfg.Cache.TTL()),
+				AccessedAt:   time.Now(),
+				BuildRequest: *req,
+			}
+
+			if err := p.cache.CommitWrite(entry); err != nil {
+				p.log.Warn("failed to commit cache entry",
+					zap.Error(err),
+					zap.String("request_id", req.RequestID),
+				)
+				metricsIncErrors("cache_write")
+			} else {
+				p.log.Info("binary cached",
+					zap.String("request_id", req.RequestID),
+					zap.String("cache_key", cacheKey),
+					zap.Int64("file_size", bytesWritten),
+				)
+			}
+		}
+	}
+
+	metricsObserveBuildDuration(buildDuration, req.TargetPlatform.OS, req.TargetPlatform.Arch)
+	metricsObserveBinarySize(bytesWritten, req.TargetPlatform.OS, req.TargetPlatform.Arch)
+
+	return nil
+}
+
+// handleVeloxBinaryResponse handles Velox response containing binary data directly.
+func (p *Plugin) handleVeloxBinaryResponse(ctx context.Context, w http.ResponseWriter, veloxResp *http.Response, req *BuildRequest, cacheKey string, buildStart time.Time) error {
+	// Prepare cache file (if caching enabled)
+	var cacheWriter io.WriteCloser
+	var cachePath string
+	var err error
 
 	if p.cache != nil {
 		cacheWriter, cachePath, err = p.cache.PrepareWrite(cacheKey)
@@ -276,10 +446,11 @@ func (p *Plugin) buildAndStream(ctx context.Context, w http.ResponseWriter, req 
 	buildDuration := time.Since(buildStart)
 	w.Header().Set("X-Build-Time", fmt.Sprintf("%.1f", buildDuration.Seconds()))
 
-	p.log.Info("build completed",
+	p.log.Info("build completed and streamed",
 		zap.String("request_id", req.RequestID),
 		zap.Duration("build_duration", buildDuration),
 		zap.Int64("bytes_written", bytesWritten),
+		zap.String("source", "direct_stream"),
 	)
 
 	// Finalize cache entry
@@ -310,7 +481,7 @@ func (p *Plugin) buildAndStream(ctx context.Context, w http.ResponseWriter, req 
 				)
 				metricsIncErrors("cache_write")
 			} else {
-				p.log.Info("binary cached",
+				p.log.Debug("binary cached",
 					zap.String("request_id", req.RequestID),
 					zap.String("cache_key", cacheKey),
 					zap.Int64("file_size", bytesWritten),

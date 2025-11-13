@@ -27,7 +27,9 @@ func NewVeloxClient(cfg *Config, log *zap.Logger) (*VeloxClient, error) {
 		cfg:       cfg,
 		log:       log.Named("velox_client"),
 		httpClient: &http.Client{
-			Timeout: cfg.RequestTimeout,
+			// Use BuildTimeout for HTTP client since builds are long-running operations
+			// The individual HTTP request timeout must be >= the build timeout
+			Timeout: cfg.BuildTimeout + (30 * time.Second), // Add buffer for network overhead
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
@@ -53,14 +55,25 @@ func (c *VeloxClient) Build(ctx context.Context, req *BuildRequest) (*http.Respo
 
 		lastErr = err
 
-		// Don't retry on context cancellation or validation errors
+		// Don't retry on context cancellation
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 
-		// Don't retry on 4xx errors (client errors)
+		// Don't retry on client errors (4xx), except for 409 which might resolve
 		if resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return nil, err
+			// 409 (Conflict) means build already in progress - we should retry with longer delay
+			if resp.StatusCode == 409 {
+				c.log.Info("build already in progress, will retry with longer delay",
+					zap.String("request_id", req.RequestID),
+					zap.Int("attempt", attempt),
+				)
+				// Use a longer delay for 409 to give the existing build time to complete
+				delay = c.cfg.Retry.MaxDelay
+			} else {
+				// Other 4xx errors are non-retryable
+				return resp, err
+			}
 		}
 
 		// Last attempt, don't wait
