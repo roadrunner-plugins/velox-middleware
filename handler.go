@@ -11,22 +11,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// handleVeloxBuild processes a Velox build request intercepted from the HTTP request.
-func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request) {
+// handleVeloxBuild processes a Velox build request intercepted from the PHP worker response.
+func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, body []byte) {
 	startTime := time.Now()
 
-	// Read and parse build request from request body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		p.log.Error("failed to read request body",
-			zap.Error(err),
-			zap.String("remote_addr", r.RemoteAddr),
-		)
-		p.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to read request body", "")
-		return
-	}
-	defer r.Body.Close()
-
+	// Parse build request from PHP worker response body
 	buildReq, err := p.parseBuildRequest(body)
 	if err != nil {
 		p.log.Error("failed to parse build request",

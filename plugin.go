@@ -28,6 +28,9 @@ type Plugin struct {
 	client *VeloxClient
 	sem    *semaphore // limits concurrent builds
 
+	// Response writer pool for capturing PHP worker responses
+	writersPool sync.Pool
+
 	// Lifecycle management
 	mu      sync.RWMutex
 	serving bool
@@ -55,6 +58,17 @@ func (p *Plugin) Init(cfg Configurer, log Logger) error {
 
 	p.log = log.NamedLogger(PluginName)
 	p.stopCh = make(chan struct{})
+
+	// Initialize response writer pool for capturing PHP responses
+	p.writersPool = sync.Pool{
+		New: func() any {
+			wr := new(responseWriter)
+			wr.code = http.StatusOK
+			wr.data = make([]byte, 0, 1024) // Initial capacity for response body
+			wr.hdrToSend = make(map[string][]string, 10)
+			return wr
+		},
+	}
 
 	// Initialize metrics early
 	initMetrics()
@@ -172,7 +186,11 @@ func (p *Plugin) Weight() uint {
 }
 
 // Middleware returns the HTTP middleware function that will be registered with RoadRunner's HTTP plugin.
-// This function intercepts requests and handles Velox build requests when the special header is present.
+// This function intercepts responses from PHP workers and handles Velox build requests when detected.
+//
+// The middleware wraps the response writer to capture headers and body from PHP workers.
+// If a Velox build request is detected in the response, it intercepts and handles the build,
+// otherwise it passes the original response through to the client.
 //
 // The HTTP plugin will automatically discover and register this middleware if the plugin:
 // 1. Implements the Middleware(next http.Handler) http.Handler method
@@ -180,14 +198,67 @@ func (p *Plugin) Weight() uint {
 // 3. Is properly initialized in the Endure container
 func (p *Plugin) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if this is a Velox build request
-		if r.Header.Get(HeaderVeloxBuild) != "true" {
-			// Not a Velox request, pass through to next handler
-			next.ServeHTTP(w, r)
+		// Create a response writer wrapper to capture PHP worker response
+		rrWriter := p.getWriter()
+		defer p.putWriter(rrWriter)
+
+		// Pass request to PHP worker
+		next.ServeHTTP(rrWriter, r)
+
+		// Check if PHP worker returned a Velox build request
+		if rrWriter.Header().Get(HeaderVeloxBuild) != "true" {
+			// Not a Velox request, pass through original response
+			p.passthroughResponse(w, rrWriter)
 			return
 		}
 
-		// Handle Velox build request
-		p.handleVeloxBuild(w, r)
+		// Velox build request detected - intercept and handle
+		p.log.Info("velox build request detected from PHP worker",
+			zap.String("path", r.URL.Path),
+			zap.String("method", r.Method),
+		)
+
+		// Handle Velox build request using the response body from PHP
+		p.handleVeloxBuild(w, r, rrWriter.data)
 	})
+}
+
+// getWriter retrieves a response writer from the pool.
+func (p *Plugin) getWriter() *responseWriter {
+	return p.writersPool.Get().(*responseWriter)
+}
+
+// putWriter returns a response writer to the pool after resetting its state.
+func (p *Plugin) putWriter(w *responseWriter) {
+	w.code = http.StatusOK
+	w.data = w.data[:0] // Reset slice but keep capacity
+
+	// Clear headers map
+	for k := range w.hdrToSend {
+		delete(w.hdrToSend, k)
+	}
+
+	p.writersPool.Put(w)
+}
+
+// passthroughResponse writes the original PHP worker response to the client.
+// This is called when the response doesn't contain a Velox build request.
+func (p *Plugin) passthroughResponse(w http.ResponseWriter, rrWriter *responseWriter) {
+	// Copy all headers from PHP worker response
+	for k := range rrWriter.hdrToSend {
+		for _, v := range rrWriter.hdrToSend[k] {
+			w.Header().Add(k, v)
+		}
+	}
+
+	// Write status code
+	w.WriteHeader(rrWriter.code)
+
+	// Write body if exists
+	if len(rrWriter.data) > 0 {
+		_, err := w.Write(rrWriter.data)
+		if err != nil {
+			p.log.Error("failed to write passthrough response", zap.Error(err))
+		}
+	}
 }
