@@ -1,6 +1,8 @@
 package veloxmiddleware
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -129,9 +131,31 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, body [
 	metricsObserveStreamTTFB(time.Since(startTime), "miss")
 }
 
-// parseBuildRequest parses the build request from the request body.
+// parseBuildRequest parses the build request from the response body.
+// The body may be gzip-compressed if the PHP worker has gzip enabled.
 func (p *Plugin) parseBuildRequest(body []byte) (*BuildRequest, error) {
 	var req BuildRequest
+
+	// Detect gzip compression by checking magic bytes (0x1f 0x8b)
+	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+		// Decompress gzip data
+		gr, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer gr.Close()
+
+		decompressed, err := io.ReadAll(gr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress gzip data: %w", err)
+		}
+
+		body = decompressed
+		p.log.Debug("decompressed gzip response body",
+			zap.Int("compressed_size", len(body)),
+			zap.Int("decompressed_size", len(decompressed)),
+		)
+	}
 
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
