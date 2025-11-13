@@ -339,7 +339,7 @@ func (p *Plugin) handleVeloxPathResponse(ctx context.Context, w http.ResponseWri
 	// Write headers - after this point, we can't send error responses
 	w.WriteHeader(http.StatusOK)
 
-	// Stream file to client and cache simultaneously
+	// Stream file to client and cache simultaneously with explicit flushing
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
 
@@ -350,25 +350,54 @@ func (p *Plugin) handleVeloxPathResponse(ctx context.Context, w http.ResponseWri
 	}
 
 	multiWriter := io.MultiWriter(writers...)
-	bytesWritten, err := io.CopyBuffer(multiWriter, file, buf)
-	if err != nil {
-		if cacheWriter != nil {
-			// Delete incomplete cache file
-			p.cache.CleanupFailedWrite(cachePath)
+	flusher, hasFlusher := w.(http.Flusher)
+
+	var bytesWritten int64
+
+	// Manual streaming loop with explicit flushing (like sendfile plugin)
+	for {
+		n, readErr := file.Read(buf)
+		if readErr != nil && readErr != io.EOF {
+			if cacheWriter != nil {
+				p.cache.CleanupFailedWrite(cachePath)
+			}
+			metricsIncErrors("file_read")
+			return fmt.Errorf("failed to read file: %w", readErr)
 		}
 
-		// Check if client disconnect
-		if isClientDisconnect(err) {
-			p.log.Warn("client disconnected during streaming",
-				zap.String("request_id", req.RequestID),
-				zap.Int64("bytes_streamed", bytesWritten),
-			)
-			metricsIncClientDisconnects("streaming")
-		} else {
-			metricsIncErrors("stream")
+		if n > 0 {
+			// Write chunk to client and cache
+			written, writeErr := multiWriter.Write(buf[:n])
+			bytesWritten += int64(written)
+
+			if writeErr != nil {
+				if cacheWriter != nil {
+					p.cache.CleanupFailedWrite(cachePath)
+				}
+
+				if isClientDisconnect(writeErr) {
+					p.log.Warn("client disconnected during streaming",
+						zap.String("request_id", req.RequestID),
+						zap.Int64("bytes_streamed", bytesWritten),
+					)
+					metricsIncClientDisconnects("streaming")
+				} else {
+					metricsIncErrors("stream")
+				}
+
+				return fmt.Errorf("failed to stream binary: %w", writeErr)
+			}
+
+			// CRITICAL: Flush after each chunk to prevent buffering and client timeouts
+			// This is the key difference from standard io.Copy - explicit flushing
+			if hasFlusher {
+				flusher.Flush()
+			}
 		}
 
-		return fmt.Errorf("failed to stream binary: %w", err)
+		if readErr == io.EOF {
+			break
+		}
 	}
 
 	buildDuration := time.Since(buildStart)
