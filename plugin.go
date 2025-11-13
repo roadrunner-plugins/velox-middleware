@@ -31,6 +31,9 @@ const (
 	// ContentTypeOctetStream is the content type for binary responses
 	ContentTypeOctetStream = "application/octet-stream"
 
+	// buildEndpoint is the Velox build service endpoint path
+	buildEndpoint = "/api.service.v1.BuildService/Build"
+
 	// bufSize is the buffer size for file streaming (10MB)
 	bufSize = 10 * 1024 * 1024
 )
@@ -100,7 +103,7 @@ func (p *Plugin) Init(cfg Configurer, log Logger) error {
 		},
 	}
 
-	p.log.Info("velox middleware initialized",
+	p.log.Debug("velox middleware initialized",
 		zap.String("server_url", p.cfg.ServerURL),
 		zap.Duration("build_timeout", p.cfg.BuildTimeout),
 		zap.Duration("request_timeout", p.cfg.RequestTimeout),
@@ -182,7 +185,7 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 		return
 	}
 
-	p.log.Info("processing velox build request",
+	p.log.Debug("processing velox build request",
 		zap.String("request_id", buildReq.RequestID),
 		zap.String("os", buildReq.TargetPlatform.OS),
 		zap.String("arch", buildReq.TargetPlatform.Arch),
@@ -210,30 +213,17 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 		return
 	}
 
-	// Check build success
-	if !veloxResp.Success {
-		p.log.Error("velox build failed",
-			zap.String("request_id", buildReq.RequestID),
-			zap.String("error", veloxResp.Error),
-			zap.String("code", veloxResp.Code),
-		)
-		http.Error(w, fmt.Sprintf("Build failed: %s", veloxResp.Error), http.StatusInternalServerError)
-		return
-	}
-
 	// Validate file path
 	if veloxResp.Path == "" {
 		p.log.Error("velox response missing file path",
 			zap.String("request_id", buildReq.RequestID),
 		)
-		http.Error(w, "Build response missing file path", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Build failed: %s", veloxResp.Logs), http.StatusInternalServerError)
 		return
 	}
 
-	p.log.Info("velox build completed",
+	p.log.Debug("velox build completed",
 		zap.String("request_id", buildReq.RequestID),
-		zap.String("build_id", veloxResp.BuildID),
-		zap.Int64("duration_ms", veloxResp.DurationMs),
 		zap.String("file_path", veloxResp.Path),
 	)
 
@@ -248,7 +238,7 @@ func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWrit
 		return
 	}
 
-	p.log.Info("file streamed successfully",
+	p.log.Debug("file streamed successfully",
 		zap.String("request_id", buildReq.RequestID),
 		zap.String("file_path", veloxResp.Path),
 	)
@@ -290,7 +280,8 @@ func (p *Plugin) requestBuild(ctx context.Context, buildReq *BuildRequest) (*Vel
 		}
 
 		// Create HTTP request
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.ServerURL, bytes.NewReader(payload))
+		buildURL := strings.TrimRight(p.cfg.ServerURL, "/") + buildEndpoint
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, buildURL, bytes.NewReader(payload))
 		if err != nil {
 			lastErr = err
 			continue

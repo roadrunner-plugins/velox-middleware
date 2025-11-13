@@ -195,10 +195,8 @@ spikes.
 All operations are logged with structured context:
 
 ```go
-p.log.Info("velox build completed",
+p.log.Debug("velox build completed",
 zap.String("request_id", buildReq.RequestID),
-zap.String("build_id", veloxResp.BuildID),
-zap.Int64("duration_ms", veloxResp.DurationMs),
 zap.String("file_path", veloxResp.Path),
 )
 ```

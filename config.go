@@ -9,7 +9,8 @@ import (
 
 // Config holds the plugin configuration
 type Config struct {
-	// ServerURL is the Velox build server endpoint (required)
+	// ServerURL is the Velox build server base URL (required)
+	// The build endpoint path will be appended automatically
 	ServerURL string `mapstructure:"server_url"`
 
 	// BuildTimeout is the maximum time to wait for build completion (default: 5m)
@@ -134,21 +135,6 @@ type BuildPlugin struct {
 
 // VeloxResponse represents the response from Velox server
 type VeloxResponse struct {
-	// Success indicates whether the build was successful
-	Success bool `json:"success"`
-
-	// Path is the absolute path to the built binary (on success)
-	Path string `json:"path,omitempty"`
-
-	// BuildID is a unique identifier for the build
-	BuildID string `json:"build_id,omitempty"`
-
-	// DurationMs is the build duration in milliseconds
-	DurationMs int64 `json:"duration_ms,omitempty"`
-
-	// Error is the error message (on failure)
-	Error string `json:"error,omitempty"`
-
-	// Code is the error code (on failure)
-	Code string `json:"code,omitempty"`
+	Path string `json:"path"`
+	Logs string `json:"logs"`
 }
