@@ -140,9 +140,6 @@ func (p *Plugin) Middleware(next http.Handler) http.Handler {
 func (p *Plugin) handleVeloxBuild(w http.ResponseWriter, r *http.Request, rrWriter *writer) {
 	ctx := r.Context()
 
-	// Delete the Velox header from response
-	rrWriter.Header().Del(xVeloxBuildHeader)
-
 	// Decode response body if gzipped
 	data := rrWriter.data
 	if rrWriter.Header().Get("Content-Encoding") == "gzip" {
