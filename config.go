@@ -111,7 +111,7 @@ type BuildRequest struct {
 	RRVersion string `json:"rr_version"`
 
 	// Plugins is the list of plugins to include in the build
-	Plugins []Plugin `json:"plugins"`
+	Plugins []BuildPlugin `json:"plugins"`
 }
 
 // Platform represents the target platform
@@ -123,8 +123,8 @@ type Platform struct {
 	Arch string `json:"arch"`
 }
 
-// Plugin represents a RoadRunner plugin
-type Plugin struct {
+// BuildPlugin represents a RoadRunner plugin in the build request
+type BuildPlugin struct {
 	// ModuleName is the full Go module path
 	ModuleName string `json:"module_name"`
 
